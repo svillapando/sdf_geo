@@ -15,10 +15,10 @@ X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
 P = np.stack([X, Y, Z], axis=-1)  # shape: (res, res, res, 3)
 
 # Define shapes (sphere and box)
-c = np.zeros(3)                         #Sphere center
-R = 2.0                                 #Sphere radius
+c = np.zeros(3)                          #Sphere center
+R = 2.0                                  #Sphere radius
 diag_lower = np.array([-4, -1, -1])      #Lower diagonal of box
-diag_upper= np.array([4, 1, 1])         #Upper diagonal of box
+diag_upper= np.array([4, 1, 1])          #Upper diagonal of box
 
 
 # Evaluate box and sphere SDF
@@ -29,10 +29,7 @@ phi_sphere = sdf_sphere(P, center = c, radius = R)
 phi_union = smooth_union(phi_box, phi_sphere)
 
 
-
 # Visualization
 plot_2d_slice(phi_union, x, y, title="2D Slice of Union SDF")
 plot_3d_isosurface(phi_union, x, y, z)
-
-
 
