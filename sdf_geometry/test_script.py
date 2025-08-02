@@ -2,9 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from sdf_geometry.primitives import sdf_box, sdf_sphere
-from sdf_geometry.operations import smooth_union
+from sdf_geometry.operations import smooth_union, smooth_intersection, smooth_subtraction
 from sdf_geometry.visualization import plot_2d_slice, plot_3d_isosurface
 
+# ==== USER DEFINED PARAMETERS === 
+
+# Choose Operation 1: Union, 2: Intersction, 3: Subtraction (A -B)
+operation = 3   
 
 # Create a 3D grid to evaluate SDF
 res = 100
@@ -20,16 +24,27 @@ R = 2.0                                  #Sphere radius
 diag_lower = np.array([-4, -1, -1])      #Lower diagonal of box
 diag_upper= np.array([4, 1, 1])          #Upper diagonal of box
 
+# === END USER DEFINED PARAMETERS ===
+
+
 
 # Evaluate box and sphere SDF
 phi_box = sdf_box(P, bmin=diag_lower, bmax=diag_upper)
 phi_sphere = sdf_sphere(P, center = c, radius = R)
 
-# Combine with smooth union
-phi_union = smooth_union(phi_box, phi_sphere)
+# Compute Operation
+if operation == 1:
+    phi_union = smooth_union(phi_box, phi_sphere)
+    plot_2d_slice(phi_union, x, y, title="2D Slice of Union SDF")
+    plot_3d_isosurface(phi_union, x, y, z)
+elif operation == 2:
+    phi_intersection = smooth_intersection(phi_box, phi_sphere)
+    plot_2d_slice(phi_intersection, x, y, title="2D Slice of Intersection SDF")
+    plot_3d_isosurface(phi_intersection, x, y, z)
+else:
+    phi_subtraction = smooth_subtraction(phi_sphere, phi_box)
+    plot_2d_slice(phi_subtraction, x, y, title="2D Slice of Subtraction SDF")
+    plot_3d_isosurface(phi_subtraction, x, y, z)
 
 
-# Visualization
-plot_2d_slice(phi_union, x, y, title="2D Slice of Union SDF")
-plot_3d_isosurface(phi_union, x, y, z)
 
