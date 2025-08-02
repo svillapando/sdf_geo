@@ -1,20 +1,8 @@
 import numpy as np
+import matplotlib.pyplot as plt
 
-def sdf_box(p, bmin, bmax):
-    bmin = np.array(bmin)
-    bmax = np.array(bmax)
-    center = 0.5 * (bmin + bmax)
-    half_size = 0.5 * (bmax - bmin)
-    q = np.abs(p - center) - half_size
-    q_clip = np.maximum(q, 0.0)
-    return np.linalg.norm(q_clip, axis=-1) + np.minimum(np.max(q, axis=-1), 0.0)
-
-def sdf_sphere(p, center, radius):
-    return np.linalg.norm(p - center, axis=-1) - radius
-
-def smooth_union(a, b, k=8.0):
-    return -np.log(np.exp(-k*a) + np.exp(-k*b)) / k
-
+from sdf_geometry.primitives import sdf_box, sdf_sphere
+from sdf_geometry.operations import smooth_union
 
 # Create a 3D grid
 res = 100
@@ -92,5 +80,5 @@ test_pts = np.array([
 ])
 
 for pt in test_pts:
-    val = smooth_union(sdf_box(pt, [-4, -1, -1], [4, 1, 1]), sdf_sphere(pt))
+    val = smooth_union(sdf_box(pt, [-4, -1, -1], [4, 1, 1]), sdf_sphere(pt, c, R))
     print(f"φ({pt}) = {val:.4f}")
