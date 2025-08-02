@@ -1,0 +1,8 @@
+setup.py
+sdf_geometry/__init__.py
+sdf_geometry/core.py
+sdf_geometry.egg-info/PKG-INFO
+sdf_geometry.egg-info/SOURCES.txt
+sdf_geometry.egg-info/dependency_links.txt
+sdf_geometry.egg-info/requires.txt
+sdf_geometry.egg-info/top_level.txt

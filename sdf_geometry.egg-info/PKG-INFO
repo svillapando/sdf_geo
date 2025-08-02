@@ -1,0 +1,9 @@
+Metadata-Version: 2.1
+Name: sdf_geometry
+Version: 0.1
+Summary: Composable SDFs for geometric modeling and optimization
+Home-page: https://github.com/YOUR_USERNAME/sdf_geometry
+Author: Your Name
+Requires-Dist: numpy
+Requires-Dist: matplotlib
+Requires-Dist: pyvista
