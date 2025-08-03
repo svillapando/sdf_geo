@@ -11,9 +11,7 @@ def plot_2d_slice(phi: np.ndarray, x: np.ndarray, y: np.ndarray, z_idx: int = No
     """Plot a 2D Z-slice of a 3D SDF field using matplotlib."""
     if z_idx is None:
         z_idx = phi.shape[2] // 2  # middle slice by default
-
     phi_slice = phi[:, :, z_idx]
-
     plt.figure()
     cf = plt.contourf(x, y, phi_slice.T, levels=50, cmap='RdBu')
     plt.contour(x, y, phi_slice.T, levels=[0.0], colors='black', linewidths=2)
