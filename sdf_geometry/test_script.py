@@ -23,16 +23,19 @@ P = csdl.Variable(value = np.stack([X, Y, Z], axis=-1))  # shape: (res, res, res
 
 # Define shapes (sphere and box)
 c = np.zeros(3)                             #Sphere center
-R = 2.0                                     #Sphere radius
-diag_lower = np.array([-0.5, -3, -3])       #Lower diagonal of box
-diag_upper= np.array([0.5, 3, 3])           #Upper diagonal of box
+R = 1.0                                     #Sphere radius
+center = np.array([0.0, 0.0, 0.0])          #Box Center
+half_size = np.array([0.5, 1.5, 1.5])       #Box lengths in BODY axis
+#rotation_angles = [30, 15, 60]             #Degrees about GLOBAL x, y, z axes
+rotation_angles = [45, 0, 0]
+
 
 # === END USER DEFINED PARAMETERS ===
 
 
 
 # Evaluate box and sphere SDF
-phi_box = sdf_box(P, bmin=diag_lower, bmax=diag_upper)
+phi_box = sdf_box(P, center, half_size, rotation_angles)
 phi_sphere = sdf_sphere(P, center = c, radius = R)
 
 # Compute Operation
