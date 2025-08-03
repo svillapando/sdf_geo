@@ -1,14 +1,22 @@
 import numpy as np
+import csdl_alpha as csdl
+
+
 
 def sdf_box(p, bmin, bmax):
     bmin = np.array(bmin)
     bmax = np.array(bmax)
-    center = 0.5 * (bmin + bmax)
-    half_size = 0.5 * (bmax - bmin)
-    q = np.abs(p - center) - half_size
-    q_clip = np.maximum(q, 0.0)
-    return np.linalg.norm(q_clip, axis=-1) + np.minimum(np.max(q, axis=-1), 0.0)
+    center = np.broadcast_to(0.5 * (bmin + bmax), p.shape)
+    half_size = np.broadcast_to(0.5 * (bmax - bmin), p.shape)
+    q = csdl.absolute(p - center) - half_size
+    q_clip = csdl.maximum(q, np.broadcast_to(0.0, q.shape))
+    last_axis_qclip = len(q_clip.shape) - 1
+    last_axis_q = len(q.shape) -1
+    return csdl.norm(q_clip,axes=(last_axis_qclip,)) + csdl.minimum(csdl.maximum(q, axes=(last_axis_q,)), np.broadcast_to(0.0, (100,100,100)))
 
 def sdf_sphere(p, center, radius):
-    return np.linalg.norm(p - center, axis=-1) - radius
+    center = np.broadcast_to(center, p.shape)
+    dist = p - center
+    last_axis_dist = len(dist.shape)-1
+    return csdl.norm(dist, axes = (last_axis_dist,)) - radius
  
