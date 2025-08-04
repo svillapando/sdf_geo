@@ -20,7 +20,13 @@ def sdf_box(p, center, half_size, rotation_angles, degrees=True):
 
     # Compute distance to surface (only if outside)
     q_clip = csdl.maximum(q, np.broadcast_to(0.0, q.shape))
-    norm_val = csdl.norm(q_clip, axes=(len(q.shape)-1,))
+
+    # If test points are single points vs mesh
+    if len(q_clip.shape) == 1:
+        norm_val = csdl.norm(q_clip)  
+    else:
+        norm_val = csdl.norm(q_clip, axes=(len(q.shape) - 1,))
+    
 
     # Compute distance to surface (only if inside)
     q_max = csdl.maximum(q, axes=(len(q.shape)-1,))
@@ -33,5 +39,41 @@ def sdf_sphere(p, center, radius):
     center = np.broadcast_to(center, p.shape)
     dist = p - center
     last_axis_dist = len(dist.shape)-1
-    return csdl.norm(dist, axes = (last_axis_dist,)) - radius
+    if len(p.shape) == 1:
+        return csdl.norm(dist) - radius
+    else:
+        return csdl.norm(dist, axes = (last_axis_dist,)) - radius
  
+def sdf_plane(p, p0, normal):
+    # --- Note: same side as normal n ---> phi > 0
+    # Expand p0 and normal to match p
+    p0_bcast = np.broadcast_to(p0, p.shape)
+    n_bcast = np.broadcast_to(normal, p.shape)
+
+    delta = p - p0_bcast
+    return csdl.sum(delta * n_bcast, axes=(len(p.shape) - 1,))
+
+def sdf_capsule(p, p1, p2, radius):
+
+    # Axis of the cylinder
+    ba = p2 - p1  # (3,)
+    axis_len_sq = np.sum(ba * ba)
+
+    # Vector from p1 to query point
+    pa = p - np.broadcast_to(p1, p.shape)  # (..., 3)
+
+    # Project onto the axis
+    t_numer = csdl.sum(pa * np.broadcast_to(ba, p.shape), axes=(len(p.shape) - 1,))
+    t = t_numer / axis_len_sq
+    t_clamped = csdl.maximum(np.broadcast_to(0, t.shape), csdl.minimum(np.broadcast_to(1, t.shape), t)) #Clamp between 0 and 1
+    t_clamped_expanded = csdl.expand(t_clamped, out_shape = p.shape , action='ijk->ijkv')
+
+    # Closest point on axis segment
+    proj = np.broadcast_to(p1, p.shape) + t_clamped_expanded * np.broadcast_to(ba, p.shape)
+
+    # Distance from point to axis line
+    if len(p.shape) == 1:
+        d = csdl.norm(p - proj) - radius
+    else:
+        d = csdl.norm(p - proj, axes=(len(p.shape) - 1,)) - radius 
+    return d
