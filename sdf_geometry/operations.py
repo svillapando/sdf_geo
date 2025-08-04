@@ -1,15 +1,20 @@
 import numpy as np
 import csdl_alpha as csdl
+from typing import Callable
 
-# Both A and B
-def smooth_union(a, b):
-    return csdl.minimum(a,b)
- 
-# Only overlapping regions of A and B
-def smooth_intersection(a, b):
-    return csdl.maximum(a,b)
+SDF = Callable[[np.ndarray], np.ndarray]  # SDF: (..., 3) -> (...)
 
-# Parts of A that are NOT inside B (A - B)
-def smooth_subtraction(a, b):
-    return smooth_intersection(a, -b)
+def smooth_union(f1: SDF, f2: SDF) -> SDF:
+    def _union(p):
+        return csdl.minimum(f1(p), f2(p))
+    return _union
 
+def smooth_intersection(f1: SDF, f2: SDF) -> SDF:
+    def _intersection(p):
+        return csdl.maximum(f1(p), f2(p))
+    return _intersection
+
+def smooth_subtraction(f1: SDF, f2: SDF) -> SDF:
+    def _subtract(p):
+        return csdl.maximum(f1(p), -f2(p))
+    return _subtract
