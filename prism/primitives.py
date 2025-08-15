@@ -8,7 +8,6 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
         R = Rotation.from_euler('xyz', rotation_angles, degrees=degrees).as_matrix()
         R_T = R.T
 
-        #center_bcast = np.broadcast_to(center, p.shape)
 
         if len(p.shape) == 1:
             # Single point: no broadcast needed
@@ -25,8 +24,7 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
         last_axis = len(p_local.shape) - 1
         p_rot = csdl.tensordot(p_local, R_T, axes=([last_axis], [1]))  # (..., 3)
 
-        #half_bcast = np.broadcast_to(half_size, p.shape)
-        
+  
         if len(p.shape) == 1:
             # Single point: no broadcast needed
             half_bcast = half_size
@@ -55,8 +53,7 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
 
 def sdf_sphere(center, radius):
     def _sdf(p):
-        #center_bcast = np.broadcast_to(center, p.shape)
-
+     
         if len(p.shape) == 1:
             # Single point: no broadcast needed
             center_bcast = center
@@ -91,26 +88,29 @@ def sdf_capsule(p1, p2, radius):
         if len(p.shape) == 1:
             # Single point: no broadcast needed
             p1_bcast = p1
-            p2_bcast = p2
         else:
             # General case: outer product with ones over leading dims
             lead_shape = p.shape[:-1]
             ones_leading = np.ones(lead_shape)
             p1_bcast = csdl.tensordot(ones_leading, p1, axes=None)
-            p2_bcast = csdl.tensordot(ones_leading, p2, axes=None)
 
-        ba = p2_bcast - p1_bcast  # (3,)
+        ba = p2-p1 # (3,) 
         axis_len_sq = csdl.sum(ba * ba)
 
         pa = p - p1_bcast  # (..., 3)
 
-        t_numer = csdl.sum(pa * ba, axes=(len(p.shape) - 1,))
-        t = t_numer / axis_len_sq
-        t_clamped = csdl.maximum(np.broadcast_to(0, t.shape),
-                                 csdl.minimum(np.broadcast_to(1, t.shape), t))
+        last = len(p.shape) - 1
+        # instead of: t_numer = csdl.sum(pa * ba, axes=(last,))
+        t_numer = csdl.tensordot(pa, ba, axes=([last], [0]))   # shape (...)
 
-        t_clamped_expanded = csdl.expand(t_clamped, out_shape=p.shape, action='ijk->ijkv')
-        proj = p1_bcast + t_clamped_expanded * ba
+        t = t_numer / axis_len_sq
+        # clamp with floats (avoid int-casting t)
+        t = csdl.minimum(csdl.maximum(t, np.broadcast_to(0.0, t.shape)),
+                        np.broadcast_to(1.0, t.shape))
+
+        # instead of making t_vec then multiplying by ba (which would broadcast),
+        # directly make the outer product (…,1)·(3,) → (…,3)
+        proj = p1_bcast + csdl.reshape(csdl.tensordot(t, ba, axes=None), p.shape) 
 
         if len(p.shape) == 1:
             d = csdl.norm(p - proj) - radius
