@@ -1,9 +1,9 @@
 import numpy as np
 import csdl_alpha as csdl
 
-import prism.primitives as prim
-import prism.operations as op
-from prism.visualization import plot_2d_slice, plot_3d_isosurface
+import primitives as prim
+import operations as op
+from visualization import plot_2d_slice, plot_3d_isosurface
 
 recorder = csdl.Recorder(inline=True)
 recorder.start()
@@ -23,7 +23,7 @@ P = csdl.Variable(value=np.stack([X, Y, Z], axis=-1))  # shape: (res, res, res, 
 
 # Define shapes
 c = csdl.Variable(value = np.zeros(3))                             # Sphere center
-R = csdl.Variable(value = 1.0 )                                    # Sphere radius
+R = csdl.Variable(value = 1.0)                                     # Sphere radius
 
 center = csdl.Variable(value = np.zeros(3))                        # Box Center
 half_size = csdl.Variable(value = np.array([0.25, 1.5, 1.5]))      # Box dimensions
@@ -33,8 +33,8 @@ p0 = np.zeros(3)                            # Plane origin
 n = np.array([0, 0, -1])                    # Plane normal
 
 
-p1 = csdl.Variable(value = np.array([-2, 0, 0]))                # Capsule start point
-p2 = csdl.Variable(value = np.array([2, 0, 0]))                 # Capsule end point
+p1 = csdl.Variable(value = np.array([-1, 0, 0]))                # Capsule start point
+p2 = csdl.Variable(value = np.array([1, 0, 0]))                 # Capsule end point
 
 # Test single point
 point = csdl.Variable(value=np.array([2.0, 0.0, -1.0]))
