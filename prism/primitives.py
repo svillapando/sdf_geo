@@ -2,19 +2,40 @@ import numpy as np
 import csdl_alpha as csdl
 from scipy.spatial.transform import Rotation
 
-# test
+
 def sdf_box(center, half_size, rotation_angles, degrees=True):
     def _sdf(p):
         R = Rotation.from_euler('xyz', rotation_angles, degrees=degrees).as_matrix()
         R_T = R.T
 
-        center_bcast = np.broadcast_to(center, p.shape)
+        #center_bcast = np.broadcast_to(center, p.shape)
+
+        if len(p.shape) == 1:
+            # Single point: no broadcast needed
+            center_bcast = center
+        else:
+            # General case: outer product with ones over leading dims
+            lead_shape = p.shape[:-1]
+            ones_leading = np.ones(lead_shape)
+            center_bcast = csdl.tensordot(ones_leading, center, axes=None)
+
+
         p_local = p - center_bcast  # (..., 3)
 
         last_axis = len(p_local.shape) - 1
         p_rot = csdl.tensordot(p_local, R_T, axes=([last_axis], [1]))  # (..., 3)
 
-        half_bcast = np.broadcast_to(half_size, p.shape)
+        #half_bcast = np.broadcast_to(half_size, p.shape)
+        
+        if len(p.shape) == 1:
+            # Single point: no broadcast needed
+            half_bcast = half_size
+        else:
+            # General case: outer product with ones over leading dims
+            lead_shape   = p.shape[:-1]                              # leading dims of p (could be ())
+            ones_leading = np.ones(lead_shape)
+            half_bcast = csdl.tensordot(ones_leading, half_size, axes=None)
+
         q = csdl.absolute(p_rot) - half_bcast
 
         q_clip = csdl.maximum(q, np.broadcast_to(0.0, q.shape))
@@ -34,7 +55,17 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
 
 def sdf_sphere(center, radius):
     def _sdf(p):
-        center_bcast = np.broadcast_to(center, p.shape)
+        #center_bcast = np.broadcast_to(center, p.shape)
+
+        if len(p.shape) == 1:
+            # Single point: no broadcast needed
+            center_bcast = center
+        else:
+            # General case: outer product with ones over leading dims
+            lead_shape = p.shape[:-1]
+            ones_leading = np.ones(lead_shape)
+            center_bcast = csdl.tensordot(ones_leading, center, axes=None)
+
         dist = p - center_bcast
         last_axis = len(p.shape) - 1
 
@@ -57,18 +88,29 @@ def sdf_plane(p0, normal):
 
 def sdf_capsule(p1, p2, radius):
     def _sdf(p):
-        ba = p2 - p1  # (3,)
-        axis_len_sq = np.sum(ba * ba)
+        if len(p.shape) == 1:
+            # Single point: no broadcast needed
+            p1_bcast = p1
+            p2_bcast = p2
+        else:
+            # General case: outer product with ones over leading dims
+            lead_shape = p.shape[:-1]
+            ones_leading = np.ones(lead_shape)
+            p1_bcast = csdl.tensordot(ones_leading, p1, axes=None)
+            p2_bcast = csdl.tensordot(ones_leading, p2, axes=None)
 
-        pa = p - np.broadcast_to(p1, p.shape)  # (..., 3)
+        ba = p2_bcast - p1_bcast  # (3,)
+        axis_len_sq = csdl.sum(ba * ba)
 
-        t_numer = csdl.sum(pa * np.broadcast_to(ba, p.shape), axes=(len(p.shape) - 1,))
+        pa = p - p1_bcast  # (..., 3)
+
+        t_numer = csdl.sum(pa * ba, axes=(len(p.shape) - 1,))
         t = t_numer / axis_len_sq
         t_clamped = csdl.maximum(np.broadcast_to(0, t.shape),
                                  csdl.minimum(np.broadcast_to(1, t.shape), t))
 
         t_clamped_expanded = csdl.expand(t_clamped, out_shape=p.shape, action='ijk->ijkv')
-        proj = np.broadcast_to(p1, p.shape) + t_clamped_expanded * np.broadcast_to(ba, p.shape)
+        proj = p1_bcast + t_clamped_expanded * ba
 
         if len(p.shape) == 1:
             d = csdl.norm(p - proj) - radius
