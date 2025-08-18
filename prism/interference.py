@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from typing import Callable, Dict
+from typing import Callable, Union
 import numpy as np
 import csdl_alpha as csdl
 
@@ -22,49 +22,51 @@ def _project_from_x(x: csdl.Variable, phi_x: csdl.Variable, grad_x: csdl.Variabl
 def collision_check(
     phi_A: SDF,
     phi_B: SDF,
-    x0: np.ndarray,
+    x0: Union[np.ndarray, csdl.Variable],
     *,
     newton_tol: float = 1e-8,
     newton_name: str = "collision_check",
     return_all: bool = False,
-) -> Dict[str, csdl.Variable] | csdl.Variable:
-    """Perform collision check between two SDFs.
+) -> tuple[csdl.Variable, ...] | csdl.Variable:
+    """
+    Perform collision check between two SDFs.
 
     Parameters
     ----------
     phi_A, phi_B : callable
         Functions mapping csdl.Variable(shape=(3,)) -> scalar csdl.Variable.
-    x0 : np.ndarray, shape (3,)
-        Initial seed for the Newton solve.
+    x0 : np.ndarray | csdl.Variable, shape (3,)
+        Initial seed for the Newton solve. May be a NumPy array or a CSDL Variable.
     newton_tol : float
         Convergence tolerance.
     newton_name : str
         Name for the CSDL Newton solver instance.
     return_all : bool
-        If True, return dict of all relevant variables.
-
-    Returns
-    -------
-    dict or csdl.Variable
-        If return_all=True, returns dict with keys: 'x_star', 'F_star', 'a', 'b', 'pair_gap'.
-        Else returns just 'pair_gap'.
+        If True, return tuple (x_star, F_star, a, b, pair_gap).
+        Else return just pair_gap.
     """
-    # State variable for the Newton solve
-    x = csdl.Variable(name=f"{newton_name}:x", shape=(3,), value=np.asarray(x0, dtype=float))
+    if isinstance(x0, csdl.Variable):
+        x = x0
+        use_initial_value = False
+        init_val = None
+    else:
+        x = csdl.Variable(name=f"{newton_name}:x", shape=(3,), value=np.asarray(x0, dtype=float))
+        use_initial_value = True
+        init_val = np.asarray(x0, dtype=float)
 
-    # Build F(x)
     phiA_x = phi_A(x)
     phiB_x = phi_B(x)
     F = csdl.maximum(phiA_x, phiB_x)
 
-    # Residual is the gradient of F w.r.t x
     gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
 
     solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
-    solver.add_state(x, gF, initial_value=np.asarray(x0, dtype=float))
+    if use_initial_value:
+        solver.add_state(x, gF, initial_value=init_val)
+    else:
+        solver.add_state(x, gF)
     solver.run()
 
-    # Re-evaluate at converged x
     phiA_x = phi_A(x)
     phiB_x = phi_B(x)
     gA = csdl.reshape(csdl.derivative(ofs=phiA_x, wrts=x), (3,))
@@ -78,7 +80,4 @@ def collision_check(
         return x, F, a, b, pair_gap
     return pair_gap
 
-
-__all__ = [
-    "collision_check",
-]
+__all__ = ["collision_check"]

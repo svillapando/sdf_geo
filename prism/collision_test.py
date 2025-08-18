@@ -5,7 +5,7 @@ from prism import operations as op
 from prism.visualization import plot_2d_slice, plot_3d_isosurface
 from prism.interference import collision_check
 # SCENARIO: 1=apart, 2=touching, 3=overlap
-SCENARIO = 2
+SCENARIO = 3
 GRID_N   = 64
 PLOT  = True
 
@@ -31,8 +31,8 @@ c2 = csdl.Variable(value=c2_np)
 phi1 = prim.sdf_sphere(c1, r1)
 phi2 = prim.sdf_sphere(c2, r2)
 phi_union = op.union(phi1, phi2)
-x0 = (0.5)*(c1_np + c2_np)  # Initial guess at the midpoint
-
+x0 = (0.5)*(c1_np + c2_np)      # Initial guess at the midpoint
+x0 = csdl.Variable(value  = x0) # Test both NumPy and CSDL Variable
 result = collision_check(phi1, phi2, x0, return_all=True)
 x_star = result[0].value
 F_star = result[1].value
