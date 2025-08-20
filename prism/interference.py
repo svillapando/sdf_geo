@@ -9,65 +9,143 @@ SDF = Callable[[csdl.Variable], csdl.Variable]
 
 _DEF_EPS = 1e-12
 
-
+# Collision check similar to paper
 def collision_check(
     phi_A: SDF,
     phi_B: SDF,
     x0: Union[np.ndarray, csdl.Variable],
     *,
-    gamma: float = 5.0,                 # penalty strength (try 1–20 depending on units)
-    normalize_grads: bool = True,       # use unit normals to improve conditioning
-    newton_tol: float = 1e-8,
-    newton_name: str = "collision_check_penalty",
+    # smooth joint field (csdl.maximum implements log-sum-exp with "rho")
+    rho: float = 20.0,             # higher = sharper max; start 5–20, homotope up/down as needed
+    # tiny, fixed number of gradient pulls toward tightest gap/deepest overlap
+    pull_steps: Tuple[float, ...] = (0.2, 0.1),  # fractions of length_scale
+    length_scale: float = 1.0,     # sets absolute step sizes; e.g., gate radius or drone size
     return_all: bool = False,
+    # kept for API compatibility with your KKT version (ignored here)
+    newton_tol: float = 1e-8,
+    newton_name: str = "collision_check_smooth",
+    normalize_grads: bool = False,
 ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
     """
-    Fully differentiable collision check via the penalized closest-pair stationarity:
-        (a - b) + gamma * phi_A(a) * gA_hat = 0
-        (b - a) + gamma * phi_B(b) * gB_hat = 0
-    Returns pair_gap by default; with return_all=True returns (m, F_star, a, b, pair_gap).
+    Differentiable SDF–SDF proximity/collision check without KKT/Newton.
+
+    Steps:
+      1) Define smooth joint field F(x) = lse_rho(phi_A(x), phi_B(x)) via csdl.maximum.
+      2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
+      3) Project once from x_K to each surface:
+           a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
+           b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
+      4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
+         and optionally x_K, a, b.
+
+    Returns:
+      If return_all: (x_K, F_star, a, b, gap), else just gap.
     """
+    # ---- seed x0 as leaf variable ----
+    if isinstance(x0, csdl.Variable):
+        x0_np = np.asarray(x0.value, float).reshape(3,)
+    else:
+        x0_np = np.asarray(x0, float).reshape(3,)
+    x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
 
-    # ---- numeric seeds (leaf states) ----
-    m0 = x0.value.reshape(3,) if isinstance(x0, csdl.Variable) else np.asarray(x0, float).reshape(3,)
-    a0_np = m0.copy()
-    b0_np = m0.copy()
+    # ---- unrolled gradient pulls on F(x) = lse_rho(phi_A, phi_B) ----
+    for i, frac in enumerate(pull_steps):
+        FA = phi_A(x)                       # scalar
+        FB = phi_B(x)                       # scalar
+        F  = csdl.maximum(FA, FB, rho=rho)  # smooth max (log-sum-exp) already in CSDL
 
-    a = csdl.Variable(name=f"{newton_name}:a", shape=(3,), value=a0_np)
-    b = csdl.Variable(name=f"{newton_name}:b", shape=(3,), value=b0_np)
+        gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))          # ∇F(x)
+        gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
+        step = (frac * length_scale) * gF / gF_norm
+        x = x - step
 
-    # φ and gradients
-    phiA = phi_A(a)  # scalar
-    phiB = phi_B(b)  # scalar
+    xK = x  # witness after pulls
 
-    gA = csdl.reshape(csdl.derivative(ofs=phiA, wrts=a), (3,))
-    gB = csdl.reshape(csdl.derivative(ofs=phiB, wrts=b), (3,))
+    # ---- one-step projection to each surface from xK ----
+    # A
+    FAx  = phi_A(xK)
+    gAx  = csdl.reshape(csdl.derivative(ofs=FAx, wrts=xK), (3,))
+    denA = csdl.vdot(gAx, gAx) + _DEF_EPS
+    a    = xK - (FAx / denA) * gAx
 
-    if normalize_grads:
-        gA = gA / csdl.sqrt(csdl.vdot(gA, gA) + _DEF_EPS)
-        gB = gB / csdl.sqrt(csdl.vdot(gB, gB) + _DEF_EPS)
+    # B
+    FBx  = phi_B(xK)
+    gBx  = csdl.reshape(csdl.derivative(ofs=FBx, wrts=xK), (3,))
+    denB = csdl.vdot(gBx, gBx) + _DEF_EPS
+    b    = xK - (FBx / denB) * gBx
 
-    # Stationarity residuals (6 equations,3 each)
-    R_a = (a - b) + gamma * phiA * gA   # (3,)
-    R_b = (b - a) + gamma * phiB * gB   # (3,)
-
-    # Newton solve 
-    solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
-    solver.add_state(a, R_a, initial_value=a0_np)
-    solver.add_state(b, R_b, initial_value=b0_np)
-    solver.run()
-
-    # Outputs
+    # ---- outputs (compatible with your KKT version) ----
     diff = a - b
-    pair_gap = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
-
-    m = 0.5 * (a + b)
-    # keep your scoring-compatible value if you use it downstream
-    F_star = csdl.maximum(phi_A(m), phi_B(m), rho=20.0) - 0.0507
+    gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
+    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) - 0.06
 
     if return_all:
-        return m, F_star, a, b, pair_gap
+        return xK, F_star, a, b, gap
     return F_star
+
+
+
+
+
+
+# def collision_check(
+#     phi_A: SDF,
+#     phi_B: SDF,
+#     x0: Union[np.ndarray, csdl.Variable],
+#     *,
+#     gamma: float = 5.0,                 # penalty strength (try 1–20 depending on units)
+#     normalize_grads: bool = True,       # use unit normals to improve conditioning
+#     newton_tol: float = 1e-8,
+#     newton_name: str = "collision_check_penalty",
+#     return_all: bool = False,
+# ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
+#     """
+#     Fully differentiable collision check via the penalized closest-pair stationarity:
+#         (a - b) + gamma * phi_A(a) * gA_hat = 0
+#         (b - a) + gamma * phi_B(b) * gB_hat = 0
+#     Returns pair_gap by default; with return_all=True returns (m, F_star, a, b, pair_gap).
+#     """
+
+#     # ---- numeric seeds (leaf states) ----
+#     m0 = x0.value.reshape(3,) if isinstance(x0, csdl.Variable) else np.asarray(x0, float).reshape(3,)
+#     a0_np = m0.copy()
+#     b0_np = m0.copy()
+
+#     a = csdl.Variable(name=f"{newton_name}:a", shape=(3,), value=a0_np)
+#     b = csdl.Variable(name=f"{newton_name}:b", shape=(3,), value=b0_np)
+
+#     # φ and gradients
+#     phiA = phi_A(a)  # scalar
+#     phiB = phi_B(b)  # scalar
+
+#     gA = csdl.reshape(csdl.derivative(ofs=phiA, wrts=a), (3,))
+#     gB = csdl.reshape(csdl.derivative(ofs=phiB, wrts=b), (3,))
+
+#     if normalize_grads:
+#         gA = gA / csdl.sqrt(csdl.vdot(gA, gA) + _DEF_EPS)
+#         gB = gB / csdl.sqrt(csdl.vdot(gB, gB) + _DEF_EPS)
+
+#     # Stationarity residuals (6 equations,3 each)
+#     R_a = (a - b) + gamma * phiA * gA   # (3,)
+#     R_b = (b - a) + gamma * phiB * gB   # (3,)
+
+#     # Newton solve 
+#     solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
+#     solver.add_state(a, R_a, initial_value=a0_np)
+#     solver.add_state(b, R_b, initial_value=b0_np)
+#     solver.run()
+
+#     # Outputs
+#     diff = a - b
+#     pair_gap = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
+
+#     m = 0.5 * (a + b)
+#     # keep your scoring-compatible value if you use it downstream
+#     F_star = csdl.maximum(phi_A(m), phi_B(m), rho=20.0) - 0.0507
+
+#     if return_all:
+#         return m, F_star, a, b, pair_gap
+#     return F_star
 
 # Leftover helper for below
 # def _project_from_x(x: csdl.Variable, phi_x: csdl.Variable, grad_x: csdl.Variable,
@@ -144,7 +222,7 @@ def collision_check(
 # __all__ = ["collision_check"]
 
 
-# KKT approach (issues with SDFs far apart and tangent)
+# KKT approach (issues with Nan/Inf/Singular Matrix)
 # def collision_check(
 #     phi_A: SDF,
 #     phi_B: SDF,
@@ -253,3 +331,109 @@ def collision_check(
 # ]
 
 
+
+# # Hybrid method?
+# # ----- tiny NumPy helpers (for seeding & projection) -----
+# def _fd_grad(phi_np, p, h=1e-5):
+#     p = np.asarray(p, float)
+#     g = np.zeros(3)
+#     for k in range(3):
+#         e = np.zeros(3); e[k] = 1.0
+#         g[k] = (phi_np(p + h*e) - phi_np(p - h*e)) / (2*h)
+#     return g
+
+# def _project_to_surface_np(phi_np, p, iters=12, tol=1e-10):
+#     p = np.asarray(p, float).copy()
+#     for _ in range(iters):
+#         val = float(phi_np(p))
+#         g = _fd_grad(phi_np, p)
+#         g2 = float(np.dot(g, g)) + _DEF_EPS
+#         step = val * g / g2
+#         p -= step
+#         if abs(val) < tol or np.linalg.norm(step) < tol:
+#             break
+#     return p
+
+# def _finite(x): return np.all(np.isfinite(x))
+
+# # ----- SAFE collision check: penalty -> (optional) KKT refine -> snap & guards -----
+# def collision_check_safe(
+#     phi_A, phi_B, x0,
+#     *,
+#     gamma=5.0,                 # penalty strength
+#     use_kkt_refine=True,       # run KKT after penalty
+#     normalize_grads_pen=True,  # unit normals in penalty stage
+#     normalize_grads_kkt=False, # exact scaling in KKT stage
+#     newton_tol=1e-8,
+#     jitter=1e-3,               # small seed jitter to avoid kinks/centers
+#     return_all=False,
+# ):
+#     """
+#     Always-finite closest-pair finder.
+#     Returns pair_gap by default; with return_all=True returns (x, F_star, a, b, pair_gap).
+#     """
+
+#     # 0) Make NumPy-callable SDFs for seeding
+#     phiA_np = lambda p: float(phi_A(np.asarray(p, float)))
+#     phiB_np = lambda p: float(phi_B(np.asarray(p, float)))
+
+#     # 1) Seed: project x0 to both surfaces; jitter slightly to avoid zero-gradient centers
+#     x0_np = np.asarray(getattr(x0, "value", x0), float).reshape(3,)
+#     a0 = _project_to_surface_np(phiA_np, x0_np)
+#     b0 = _project_to_surface_np(phiB_np, x0_np)
+#     if jitter > 0:
+#         a0 = a0 + jitter * np.random.randn(3)
+#         b0 = b0 + jitter * np.random.randn(3)
+#     x_init = 0.5*(a0 + b0)
+
+#     # 2) Penalty stage (robust): unit-normal penalized stationarity
+#     #    (Your existing penalty solver; shown here calling your function.)
+#     try:
+#         m_pen, F_pen, a_pen, b_pen, gap_pen = collision_check(
+#             phi_A, phi_B, x_init,
+#             gamma=gamma,
+#             normalize_grads=normalize_grads_pen,
+#             newton_tol=newton_tol,
+#             return_all=True,
+#         )
+#         a_use = np.array(a_pen.value if hasattr(a_pen, "value") else a_pen, float).reshape(3,)
+#         b_use = np.array(b_pen.value if hasattr(b_pen, "value") else b_pen, float).reshape(3,)
+#         x_use = np.array(m_pen.value if hasattr(m_pen, "value") else m_pen, float).reshape(3,)
+#     except Exception:
+#         # Fallback: just use projected seeds
+#         a_use, b_use, x_use = a0, b0, 0.5*(a0+b0)
+
+#     # 3) Optional KKT refine (exact surfaces), warm-started from penalty
+#     if use_kkt_refine:
+#         try:
+#             x_kkt, F_kkt, a_kkt, b_kkt, gap_kkt = collision_check_kkt(
+#                 phi_A, phi_B, x_use,
+#                 newton_tol=newton_tol,
+#                 normalize_grads=normalize_grads_kkt,
+#                 return_all=True,
+#                 # If your KKT takes custom seeds, pass a_use/b_use in there
+#             )
+#             a_use = np.array(a_kkt.value if hasattr(a_kkt, "value") else a_kkt, float).reshape(3,)
+#             b_use = np.array(b_kkt.value if hasattr(b_kkt, "value") else b_kkt, float).reshape(3,)
+#             x_use = np.array(x_kkt.value if hasattr(x_kkt, "value") else x_kkt, float).reshape(3,)
+#         except Exception:
+#             # keep penalty result if KKT has trouble (tangent, far apart, etc.)
+#             pass
+
+#     # 4) Snap outputs to surfaces (cheap, guarantees φ=0 for plotting/consistency)
+#     a_surf = _project_to_surface_np(phiA_np, a_use)
+#     b_surf = _project_to_surface_np(phiB_np, b_use)
+#     gap = float(np.linalg.norm(a_surf - b_surf))
+#     F_star = max(phiA_np(x_use), phiB_np(x_use))  # compatibility score at midpoint
+
+#     # 5) Final guarantees: finite values
+#     if not (_finite(a_surf) and _finite(b_surf) and np.isfinite(gap) and np.isfinite(F_star)):
+#         # As a last resort, rebuild from seeds deterministically
+#         a_surf = _project_to_surface_np(phiA_np, x0_np)
+#         b_surf = _project_to_surface_np(phiB_np, x0_np)
+#         gap = float(np.linalg.norm(a_surf - b_surf))
+#         F_star = max(phiA_np(0.5*(a_surf+b_surf)), phiB_np(0.5*(a_surf+b_surf)))
+
+#     if return_all:
+#         return x_use, F_star, a_surf, b_surf, gap
+#     return gap

@@ -2,11 +2,11 @@ import numpy as np
 import csdl_alpha as csdl
 from prism import primitives as prim
 from prism import operations as op
-from prism.visualization import plot_2d_slice, plot_3d_isosurface
+from prism.visualization import plot_2d_slice, plot_3d_isosurface, plot_isosurface_with_collision_points
 from prism.interference import collision_check
 
 # --- Controls ---
-SCENARIO = 1          # 1=apart, 2=touching, 3=overlap
+SCENARIO = 2          # 1=apart, 2=touching, 3=overlap
 GRID_N   = 64
 PLOT     = True
 
@@ -82,8 +82,8 @@ c_rot_ref = rotor_centers[0]  # [-0.5, 0.5, 0.15]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 0.2),
-                          c_rot_ref[1],
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 0.7),
+                          c_rot_ref[1],#- (rotor_radius + r_ball + 0.2),
                           c_rot_ref[2]])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
@@ -92,7 +92,7 @@ elif SCENARIO == 2:
                           c_rot_ref[2]])
 else:
     # Overlap: penetrate by 1.5 along -x
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 1.0),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 0.5),
                           c_rot_ref[1],
                           c_rot_ref[2]])
 
@@ -121,10 +121,21 @@ print("Closest point on Drone (A):", a)
 print("Closest point on Ball  (B):", b)
 print("Pair gap distance:", pair_gap)
 
+print("phi(drone) at p_drone:", phi_drone(a).value)
+print("phi(env)   at p_env:",   phi_ball(b).value)
+
 # === Visualize ===
 xg, yg, zg, P = make_grid(-2.0, 2.0, GRID_N)
 phi_val = phi_union(P).value  # evaluate on grid
 
 if PLOT:
     plot_2d_slice(phi_val, xg, yg, title=f"Drone ∪ Ball (scenario={SCENARIO})")
-    plot_3d_isosurface(phi_val, xg, yg, zg)
+    #plot_3d_isosurface(phi_val, xg, yg, zg)
+    plot_isosurface_with_collision_points(
+        phi_val, xg, yg, zg,
+        level=0.0,
+        title=f"Drone ∪ Ball Collision Check (scenario={SCENARIO})",
+        xstar=x_star,
+        p_near_drone=a,
+        p_near_env=b,
+    )
