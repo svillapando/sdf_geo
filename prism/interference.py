@@ -73,37 +73,38 @@ def collision_check(
 
 
     # ---- two-step projection to each surface from xK ----
-    # A
-    FA = phi_A(xK)
-    gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
-    gA_n = csdl.norm(gA) + _DEF_EPS
-    a1 = xK - (FA / (gA_n * gA_n)) * gA
+    if return_all:
+        # A
+        FA = phi_A(xK)
+        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
+        gA_n = csdl.norm(gA) + _DEF_EPS
+        a1 = xK - (FA / (gA_n * gA_n)) * gA
 
-    FA = phi_A(a1)
-    gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
-    gA_n = csdl.norm(gA) + _DEF_EPS
-    a = a1 - (FA / (gA_n * gA_n)) * gA
+        FA = phi_A(a1)
+        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
+        gA_n = csdl.norm(gA) + _DEF_EPS
+        a = a1 - (FA / (gA_n * gA_n)) * gA
 
-    # B
-    FB = phi_B(xK)
-    gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
-    gB_n = csdl.norm(gB) + _DEF_EPS
-    b1 = xK - (FB / (gB_n * gB_n)) * gB
+        # B
+        FB = phi_B(xK)
+        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
+        gB_n = csdl.norm(gB) + _DEF_EPS
+        b1 = xK - (FB / (gB_n * gB_n)) * gB
 
-    FB = phi_B(b1)
-    gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
-    gB_n = csdl.norm(gB) + _DEF_EPS
-    b = b1 - (FB / (gB_n * gB_n)) * gB
+        FB = phi_B(b1)
+        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
+        gB_n = csdl.norm(gB) + _DEF_EPS
+        b = b1 - (FB / (gB_n * gB_n)) * gB
 
 
-    # ---- outputs ----
-    diff = a - b
-    gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
+        # ---- outputs ----
+        diff = a - b
+        gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
     
 
     if return_all:
         return xK, F_star, a, b, gap
-    return F_star
+    return F_star, xK
 
 
 
