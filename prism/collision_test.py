@@ -3,7 +3,7 @@ import csdl_alpha as csdl
 from prism import primitives as prim
 from prism import operations as op
 from prism.visualization import plot_2d_slice, plot_3d_isosurface, plot_isosurface_with_collision_points
-from prism.interference import collision_check
+from interference import collision_check
 
 # --- Controls ---
 SCENARIO = 1          # 1=apart, 2=touching, 3=overlap
