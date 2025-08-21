@@ -139,8 +139,8 @@ def plot_isosurface_with_collision_points(
     if show_legend:
         plotter.add_legend([
             ["x* (min F)",         colors["x* (min F)"]],
-            ["nearest on drone",   colors["nearest on drone"]],
-            ["nearest on env",     colors["nearest on env"]],
+            ["nearest on A",   colors["nearest on drone"]],
+            ["nearest on B",     colors["nearest on env"]],
             ["seed",               colors["seed"]],
         ])
 
