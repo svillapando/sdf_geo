@@ -52,7 +52,7 @@ def collision_check(
 
     # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
 
-    for c_i in (0.9, 0.7, 0.5, 0.35, 0.2): 
+    for c_i in (0.9, 0.5, 0.25): 
     
 
       # inside each pull iteration
