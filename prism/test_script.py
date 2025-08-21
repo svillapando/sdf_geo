@@ -11,7 +11,7 @@ recorder.start()
 # ==== USER DEFINED PARAMETERS === 
 
 # Choose Operation 1: Union, 2: Intersection, 3: Subtraction (A - B)
-operation = 4
+operation = 2
 
 # Create a 3D grid to evaluate SDF
 res = 100
