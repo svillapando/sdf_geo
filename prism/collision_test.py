@@ -3,10 +3,10 @@ import csdl_alpha as csdl
 from prism import primitives as prim
 from prism import operations as op
 from prism.visualization import plot_2d_slice, plot_3d_isosurface, plot_isosurface_with_collision_points
-from prism.interference import collision_check
+from interference import collision_check
 
 # --- Controls ---
-SCENARIO = 2          # 1=apart, 2=touching, 3=overlap
+SCENARIO = 1          # 1=apart, 2=touching, 3=overlap
 GRID_N   = 64
 PLOT     = True
 
@@ -82,9 +82,9 @@ c_rot_ref = rotor_centers[0]  # [-0.5, 0.5, 0.15]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 0.7),
-                          c_rot_ref[1],#- (rotor_radius + r_ball + 0.2),
-                          c_rot_ref[2]])
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 0.1),
+                          c_rot_ref[1]- (rotor_radius + 0.15),
+                          c_rot_ref[2]+ 0.1])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
     c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball),
@@ -92,7 +92,7 @@ elif SCENARIO == 2:
                           c_rot_ref[2]])
 else:
     # Overlap: penetrate by 1.5 along -x
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 0.5),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 0.2),
                           c_rot_ref[1],
                           c_rot_ref[2]])
 
@@ -105,9 +105,10 @@ phi_union = op.union(phi_drone, phi_ball)
 #x0_mid_np = 0.5 * (c_ball_np + c_rot_ref)       # Midpoint Seed
 x0_mid_np = c_ball_np + 1E-1                    #Test gate offset
 x0 = csdl.Variable(value=x0_mid_np)   
+eta_max = csdl.Variable(value = 0.3)
 
 # Run
-result = collision_check(phi_drone, phi_ball, x0, return_all=True)
+result = collision_check(phi_drone, phi_ball, x0, eta_max, return_all=True)
 x_star   = result[0].value
 F_star   = result[1].value
 a        = result[2].value

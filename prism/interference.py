@@ -14,10 +14,12 @@ def collision_check(
     phi_A: SDF,
     phi_B: SDF,
     x0: Union[np.ndarray, csdl.Variable],
+    eta_max: csdl.Variable,
     *,
     # smooth joint field (csdl.maximum implements log-sum-exp with "rho")
     rho: float = 20.0,             # higher = sharper max; start 5–20, homotope up/down as needed
     # tiny, fixed number of gradient pulls toward tightest gap/deepest overlap
+
     pull_steps: Tuple[float, ...] = (0.2, 0.1),  # fractions of length_scale
     length_scale: float = 1.0,     # sets absolute step sizes; e.g., gate radius or drone size
     return_all: bool = False,
@@ -27,10 +29,10 @@ def collision_check(
     normalize_grads: bool = False,
 ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
     """
-    Differentiable SDF–SDF proximity/collision check without KKT/Newton.
+    Differentiable SDF-SDF proximity/collision check
 
     Steps:
-      1) Define smooth joint field F(x) = lse_rho(phi_A(x), phi_B(x)) via csdl.maximum.
+      1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
       2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
       3) Project once from x_K to each surface:
            a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
@@ -39,7 +41,7 @@ def collision_check(
          and optionally x_K, a, b.
 
     Returns:
-      If return_all: (x_K, F_star, a, b, gap), else just gap.
+      If return_all: (x_K, F_star, a, b, gap), else just F.
     """
     # ---- seed x0 as leaf variable ----
     if isinstance(x0, csdl.Variable):
@@ -48,36 +50,56 @@ def collision_check(
         x0_np = np.asarray(x0, float).reshape(3,)
     x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
 
-    # ---- unrolled gradient pulls on F(x) = lse_rho(phi_A, phi_B) ----
-    for i, frac in enumerate(pull_steps):
-        FA = phi_A(x)                       # scalar
-        FB = phi_B(x)                       # scalar
-        F  = csdl.maximum(FA, FB, rho=rho)  # smooth max (log-sum-exp) already in CSDL
+    # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
 
-        gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))          # ∇F(x)
+    for c_i in (0.9, 0.7, 0.5, 0.35, 0.2): 
+    
+
+      # inside each pull iteration
+        FA = phi_A(x)
+        FB = phi_B(x)
+        F  = csdl.maximum(FA, FB, rho=rho)
+
+        gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
         gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
-        step = (frac * length_scale) * gF / gF_norm
-        x = x - step
+
+        # adaptive step length: eta = min(c * |F|, eta_max)
+        eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+
+        x = x - (eta * gF / gF_norm)
 
     xK = x  # witness after pulls
+    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) - 0.07
 
-    # ---- one-step projection to each surface from xK ----
-    # A
-    FAx  = phi_A(xK)
-    gAx  = csdl.reshape(csdl.derivative(ofs=FAx, wrts=xK), (3,))
-    denA = csdl.vdot(gAx, gAx) + _DEF_EPS
-    a    = xK - (FAx / denA) * gAx
+    if return_all:
+        # ---- two-step projection to each surface from xK ----
+        # A
+        FA = phi_A(xK)
+        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
+        gA_n = csdl.norm(gA) + _DEF_EPS
+        a1 = xK - (FA / (gA_n * gA_n)) * gA
 
-    # B
-    FBx  = phi_B(xK)
-    gBx  = csdl.reshape(csdl.derivative(ofs=FBx, wrts=xK), (3,))
-    denB = csdl.vdot(gBx, gBx) + _DEF_EPS
-    b    = xK - (FBx / denB) * gBx
+        FA = phi_A(a1)
+        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
+        gA_n = csdl.norm(gA) + _DEF_EPS
+        a = a1 - (FA / (gA_n * gA_n)) * gA
 
-    # ---- outputs (compatible with your KKT version) ----
-    diff = a - b
-    gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
-    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) - 0.06
+        # B
+        FB = phi_B(xK)
+        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
+        gB_n = csdl.norm(gB) + _DEF_EPS
+        b1 = xK - (FB / (gB_n * gB_n)) * gB
+
+        FB = phi_B(b1)
+        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
+        gB_n = csdl.norm(gB) + _DEF_EPS
+        b = b1 - (FB / (gB_n * gB_n)) * gB
+
+
+        # ---- outputs ----
+        diff = a - b
+        gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
+    
 
     if return_all:
         return xK, F_star, a, b, gap
