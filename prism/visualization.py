@@ -1,14 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
-
-try:
-    import pyvista as pv
-except ImportError:
-    pv = None
-
+import pyvista as pv
 
 def plot_2d_slice(phi: np.ndarray, x: np.ndarray, y: np.ndarray, z_idx: int = None, title: str = "φ(x, y, z=0)"):
-    """Plot a 2D Z-slice of a 3D SDF field using matplotlib."""
+    #Plot a 2D Z-slice of a 3D SDF field using matplotlib
     if z_idx is None:
         z_idx = phi.shape[2] // 2  # middle slice by default
     phi_slice = phi[:, :, z_idx]
@@ -25,10 +20,8 @@ def plot_2d_slice(phi: np.ndarray, x: np.ndarray, y: np.ndarray, z_idx: int = No
 
 
 def plot_3d_isosurface(phi: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray, level: float = 0.0, title: str = "Isosurface φ = 0"):
-    """Render a 3D isosurface from a SDF using PyVista."""
-    if pv is None:
-        raise ImportError("PyVista is not installed. Run `pip install pyvista`.")
-
+    # Render a 3D isosurface from a SDF using PyVista
+    
     grid = pv.ImageData()
     grid.dimensions = np.array(phi.shape)
     grid.spacing = (x[1] - x[0], y[1] - y[0], z[1] - z[0])
