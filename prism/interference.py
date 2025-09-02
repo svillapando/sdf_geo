@@ -9,102 +9,394 @@ SDF = Callable[[csdl.Variable], csdl.Variable]
 
 _DEF_EPS = 1e-12
 
-# Collision check similar to paper
+# # Collision check similar to paper
+# def collision_check(
+#     phi_A: SDF,
+#     phi_B: SDF,
+#     x0: Union[np.ndarray, csdl.Variable],
+#     eta_max: csdl.Variable,
+#     *,
+#     rho: float = 20.0,             # higher = sharper max; start 5–20
+#     return_all: bool = False,
+#     newton_name: str = "collision_check_smooth",
+# ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
+#     """
+#     Differentiable SDF-SDF proximity/collision check
+
+#     Steps:
+#       1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
+#       2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
+#       3) Project once from x_K to each surface:
+#            a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
+#            b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
+#       4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
+#          and optionally x_K, a, b.
+
+#     Returns:
+#       If return_all: (x_K, F_star, a, b, gap), else just F.
+#     """
+#     # ---- seed x0 as leaf variable ----
+#     if isinstance(x0, csdl.Variable):
+#         x0_np = np.asarray(x0.value, float).reshape(3,)
+#     else:
+#         x0_np = np.asarray(x0, float).reshape(3,)
+#     x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
+
+#     # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
+
+#     for c_i in (0.9, 0.5, 0.25): 
+#     #for c_i in (0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7):
+
+#       # inside each pull iteration
+#         FA = phi_A(x)
+#         FB = phi_B(x)
+#         F  = csdl.maximum(FA, FB, rho=rho)
+
+#         gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
+#         gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
+
+#         # adaptive step length: eta = min(c * |F|, eta_max)
+#         eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+
+#         x = x - (eta * gF / gF_norm)
+ 
+#     xK = x
+#     F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho)
+
+
+#     #---- two-step projection to each surface from xK ----
+#     if return_all:
+#         # A
+#         FA = phi_A(xK)
+#         gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
+#         gA_n = csdl.norm(gA) + _DEF_EPS
+#         a1 = xK - (FA / (gA_n * gA_n)) * gA
+
+#         FA = phi_A(a1)
+#         gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
+#         gA_n = csdl.norm(gA) + _DEF_EPS
+#         a = a1 - (FA / (gA_n * gA_n)) * gA
+
+#         # B
+#         FB = phi_B(xK)
+#         gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
+#         gB_n = csdl.norm(gB) + _DEF_EPS
+#         b1 = xK - (FB / (gB_n * gB_n)) * gB
+
+#         FB = phi_B(b1)
+#         gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
+#         gB_n = csdl.norm(gB) + _DEF_EPS
+#         b = b1 - (FB / (gB_n * gB_n)) * gB
+
+
+#         # ---- outputs ----
+#         diff = a - b
+#         gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
+    
+#         # === equal-distance snap of xK, then one reproject ===
+#         def sgn_smooth(x, eps=_DEF_EPS):
+#         # smooth sign ≈ x / (|x| + eps)
+#             return x / (csdl.absolute(x) + eps)
+
+#         # normals at the projected points
+#         FAa = phi_A(a); gA_a = csdl.reshape(csdl.derivative(ofs=FAa, wrts=a), (3,))
+#         FBb = phi_B(b); gB_b = csdl.reshape(csdl.derivative(ofs=FBb, wrts=b), (3,))
+#         na   = gA_a / (csdl.norm(gA_a) + _DEF_EPS)
+#         nb   = gB_b / (csdl.norm(gB_b) + _DEF_EPS)
+
+#         # orient normals smoothly to point toward each other across the gap
+#         d     = a - b                          # segment from B→A
+#         na_o  = sgn_smooth(csdl.vdot(d, na)) * na
+#         nb_o  = sgn_smooth(csdl.vdot(-d, nb)) * nb
+
+#         # distances from xK to each surface along the oriented normals
+#         tA = csdl.minimum(csdl.vdot(xK - a, na_o))
+#         tB = csdl.minimum(csdl.vdot(b  - xK, nb_o))
+#         t  = 0.5 * (tA + tB)                   # force equal distance
+
+#         # snap x to the equal-distance point along normals
+#         xK = 0.5 * (a + t*na_o + b - t*nb_o)
+
+#         # reproject once from the snapped midpoint (cheap & effective)
+#         FA = phi_A(xK); gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
+#         a  = xK - (FA * gA) / (csdl.vdot(gA, gA) + _DEF_EPS)
+
+#         FB = phi_B(xK); gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
+#         b  = xK - (FB * gB) / (csdl.vdot(gB, gB) + _DEF_EPS)
+
+
+#     if return_all:
+#         gap = csdl.norm(a - b)
+#         return xK, F_star, a, b, gap
+#     return F_star, xK
+
+
+
+
+
+# It works?? Substitute lagrange multipliers
 def collision_check(
     phi_A: SDF,
     phi_B: SDF,
     x0: Union[np.ndarray, csdl.Variable],
-    eta_max: csdl.Variable,
     *,
-    # smooth joint field (csdl.maximum implements log-sum-exp with "rho")
-    rho: float = 20.0,             # higher = sharper max; start 5–20, homotope up/down as needed
-    # tiny, fixed number of gradient pulls toward tightest gap/deepest overlap
-
-    pull_steps: Tuple[float, ...] = (0.2, 0.1),  # fractions of length_scale
-    length_scale: float = 1.0,     # sets absolute step sizes; e.g., gate radius or drone size
-    return_all: bool = False,
-    # kept for API compatibility with your KKT version (ignored here)
     newton_tol: float = 1e-8,
-    newton_name: str = "collision_check_smooth",
-    normalize_grads: bool = False,
-) -> Tuple[csdl.Variable, ...] | csdl.Variable:
-    """
-    Differentiable SDF-SDF proximity/collision check
+    newton_name: str = "collision_check_stationarity",
+    return_all: bool = False,
+    normalize_grads: bool = True,
+    grad_floor: float = 1e-8,        # guard for ||∇φ||
+    reg_pos: float = 1e-6,           # tiny Tikhonov regularization (anchors at seeds)
+    surf_weight: float = 1.0,        # penalty strength pushing a,b to their surfaces
+    beta_scale_with_grad: bool = True # scale penalty by ||∇φ|| if not normalizing
+) -> tuple[csdl.Variable, ...] | csdl.Variable:
 
-    Steps:
-      1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
-      2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
-      3) Project once from x_K to each surface:
-           a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
-           b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
-      4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
-         and optionally x_K, a, b.
-
-    Returns:
-      If return_all: (x_K, F_star, a, b, gap), else just F.
-    """
-    # ---- seed x0 as leaf variable ----
-    if isinstance(x0, csdl.Variable):
+    # ----- numeric seeds -----
+    try:
         x0_np = np.asarray(x0.value, float).reshape(3,)
-    else:
+    except AttributeError:
         x0_np = np.asarray(x0, float).reshape(3,)
-    x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
 
-    # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
+    a0_np = x0_np.copy()
+    b0_np = x0_np.copy()
 
-    for c_i in (0.9, 0.5, 0.25): 
-    
+    # constants / guards
+    _eps = 1e-12
 
-      # inside each pull iteration
-        FA = phi_A(x)
-        FB = phi_B(x)
-        F  = csdl.maximum(FA, FB, rho=rho)
+    # keep copies of the seeds as constants for regularization anchors
+    a0_const = csdl.Variable(value=a0_np)
+    b0_const = csdl.Variable(value=b0_np)
 
-        gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
-        gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
+    ones3 = csdl.Variable(value=np.ones(3))
 
-        # adaptive step length: eta = min(c * |F|, eta_max)
-        eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+    # ----- states (only a and b) -----
+    a = csdl.Variable(name=f"{newton_name}:a", shape=(3,), value=a0_np)
+    b = csdl.Variable(name=f"{newton_name}:b", shape=(3,), value=b0_np)
 
-        x = x - (eta * gF / gF_norm)
+    # ----- SDF values & (safe) normals -----
+    # A
+    phiA_a = phi_A(a)                                       # scalar
+    gA     = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a), (3,))
+    if normalize_grads:
+        gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+        nA      = gA / gA_norm
+        betaA   = surf_weight
+    else:
+        # still guard the zero-gradient case
+        gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+        nA      = gA / gA_norm
+        betaA   = surf_weight * (gA_norm if beta_scale_with_grad else 1.0)
 
-    xK = x  # witness after pulls
-    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) - 0.07
+    # B
+    phiB_b = phi_B(b)                                       # scalar
+    gB     = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b), (3,))
+    if normalize_grads:
+        gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+        nB      = gB / gB_norm
+        betaB   = surf_weight
+    else:
+        gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+        nB      = gB / gB_norm
+        betaB   = surf_weight * (gB_norm if beta_scale_with_grad else 1.0)
 
+    # Reshape scalars for vector scaling
+    phiA_as3 = csdl.reshape(phiA_a, (1,)) * ones3
+    phiB_as3 = csdl.reshape(phiB_b, (1,)) * ones3
 
-    # ---- two-step projection to each surface from xK ----
+    # ----- residuals (penalized stationarity, no λ/μ states) -----
+    # Intuition: original KKT had (a - b) + λ nA = 0, (a - b) - μ nB = 0 with φ_A(a)=0, φ_B(b)=0.
+    # Here we replace λ ≈ -β φ_A(a), μ ≈  β φ_B(b), which pushes a,b to their surfaces and couples them.
+    RS_A = (a - b) + betaA * (phiA_as3 * nA) + reg_pos * (a - a0_const)  # (3,)
+    RS_B = (a - b) - betaB * (phiB_as3 * nB) + reg_pos * (b - b0_const)  # (3,)
+
+    # ----- Newton solve -----
+    solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
+    # (Optional) If your CSDL build supports it, you can also set a safe max iters, damping, etc.
+    # e.g., solver.options['max_iter'] = 80
+    solver.add_state(a, RS_A, initial_value=a0_np)   # 3 eqs
+    solver.add_state(b, RS_B, initial_value=b0_np)   # 3 eqs
+    solver.run()
+
+    # ---------- helpers (shape-safe) ----------
+    def _snap_once(p, phi, grad_floor=1e-8):
+        # One Newton projection step: p <- p - φ * n, with unit-normal and floor
+        val = phi(p)                                              # scalar
+        g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
+        n   = g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
+        return p - csdl.reshape(val, (1,)) * n                    # (3,)
+
+    def _snap_k(p0, phi, k=2, grad_floor=1e-8):
+        p = p0
+        for _ in range(k):
+            p = _snap_once(p, phi, grad_floor)
+        return p
+
+    def _unit(v, eps=1e-12):
+        return v / (csdl.sqrt(csdl.vdot(v, v)) + eps)
+
+    def _normal_at(p, phi, grad_floor=1e-8):
+        val = phi(p)  # scalar (unused; ensures correct graph deps)
+        g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
+        return g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
+
+    # ---------- alternating-projection refinement ----------
+    # Idea: land each point on the hemisphere facing the *other* body by projecting
+    # from the other body’s point. Do both orders and keep the better one.
+
+    # Option A: start from b toward A, then from a toward B (B→A→B)
+    a_A1 = _snap_k(b, phi_A, k=2, grad_floor=grad_floor)         # project B's point onto A
+    b_A1 = _snap_k(a_A1, phi_B, k=2, grad_floor=grad_floor)      # then project that onto B
+
+    # Option B: start from a toward B, then from b toward A (A→B→A)
+    b_B1 = _snap_k(a, phi_B, k=2, grad_floor=grad_floor)
+    a_B1 = _snap_k(b_B1, phi_A, k=2, grad_floor=grad_floor)
+
+    # Score both candidates by (i) smaller gap and (ii) better normal alignment
+    def _score_pair(aP, bP, phiA, phiB):
+        t   = _unit(aP - bP)
+        nA  = _normal_at(aP, phiA, grad_floor)
+        nB  = _normal_at(bP, phiB, grad_floor)
+        gap = csdl.sqrt(csdl.vdot(aP - bP, aP - bP) + 1e-12)
+        # alignment: both outward normals should align with chord (>=0, closer to 1 is better)
+        align = 0.5 * (csdl.vdot(nA, t) + csdl.vdot(nB, t))       # scalar
+        return gap, align
+
+    gap_A, align_A = _score_pair(a_A1, b_A1, phi_A, phi_B)
+    gap_B, align_B = _score_pair(a_B1, b_B1, phi_A, phi_B)
+
+    # Choose the better pair: prefer smaller gap; break ties by larger alignment
+    # (CSDL has no conditionals; pick both and *use the one you return* in Python flow)
+    use_A = True  # Python-level choice is fine since you're building the graph once per call
+    # You can fetch initial seeds’ numpy to decide, but simplest is:
+    #   if you want fully CSDL, keep both and return both to caller to choose.
+    try:
+        # If shapes were numeric Variables, take a quick numpy read for the decision:
+        use_A = (float(gap_A.value) < float(gap_B.value)) or \
+                (abs(float(gap_A.value) - float(gap_B.value)) < 1e-9 and float(align_A.value) >= float(align_B.value))
+    except Exception:
+        # Fallback: prefer A by default
+        use_A = True
+
+    a_ref = a_A1 if use_A else a_B1
+    b_ref = b_A1 if use_A else b_B1
+
+    # # Optional tiny clean-up snap to ensure |φ| ~ 0 after the alternations
+    # a_ref = _snap_once(a_ref, phi_A, grad_floor)
+    # b_ref = _snap_once(b_ref, phi_B, grad_floor)
+
+    # ---------- replace outputs ----------
+    a = a_ref
+    b = b_ref
+    diff = a - b
+    gap  = csdl.sqrt(csdl.vdot(diff, diff) + 1e-12)
+    x_mid  = 0.5 * (a + b)
+    F_star = csdl.maximum(phi_A(x_mid), phi_B(x_mid), rho=20.0)- 0.07
+
     if return_all:
-        # A
-        FA = phi_A(xK)
-        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
-        gA_n = csdl.norm(gA) + _DEF_EPS
-        a1 = xK - (FA / (gA_n * gA_n)) * gA
-
-        FA = phi_A(a1)
-        gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
-        gA_n = csdl.norm(gA) + _DEF_EPS
-        a = a1 - (FA / (gA_n * gA_n)) * gA
-
-        # B
-        FB = phi_B(xK)
-        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
-        gB_n = csdl.norm(gB) + _DEF_EPS
-        b1 = xK - (FB / (gB_n * gB_n)) * gB
-
-        FB = phi_B(b1)
-        gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
-        gB_n = csdl.norm(gB) + _DEF_EPS
-        b = b1 - (FB / (gB_n * gB_n)) * gB
+        return x_mid, F_star, a, b, gap
+    return gap
 
 
-        # ---- outputs ----
-        diff = a - b
-        gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
-    
 
-    if return_all:
-        return xK, F_star, a, b, gap
-    return F_star, xK
+#IDK ANYMORE KKT AGAIN
+# def collision_check(
+#     phi_A: SDF,
+#     phi_B: SDF,
+#     x0: Union[np.ndarray, csdl.Variable],
+#     *,
+#     newton_tol: float = 1e-8,
+#     newton_name: str = "collision_check_stationarity",
+#     return_all: bool = False,
+#     normalize_grads: bool = True,
+#     grad_floor: float = 1e-8,        # guard for ||∇φ||
+#     reg_pos: float = 1e-6            # tiny Tikhonov regularization in stationarity eqs
+# ) -> tuple[csdl.Variable, ...] | csdl.Variable:
+
+#     # ----- numeric seeds -----
+#     try:
+#         x0_np = np.asarray(x0.value, float).reshape(3,)
+#     except AttributeError:
+#         x0_np = np.asarray(x0, float).reshape(3,)
+
+#     a0_np   = x0_np.copy()
+#     b0_np   = x0_np.copy()
+#     lam0_np = np.array([0.0], dtype=float)
+#     mu0_np  = np.array([0.0], dtype=float)
+
+#     # constants / guards
+#     _eps = 1e-12 if "_DEF_EPS" in globals() else 1e-12
+
+#     # keep copies of the seeds as constants for regularization anchors
+#     a0_const = csdl.Variable(value=a0_np)
+#     b0_const = csdl.Variable(value=b0_np)
+
+#     # ----- states -----
+#     a   = csdl.Variable(name=f"{newton_name}:a",   shape=(3,), value=a0_np)
+#     b   = csdl.Variable(name=f"{newton_name}:b",   shape=(3,), value=b0_np)
+#     lam = csdl.Variable(name=f"{newton_name}:lam", shape=(1,), value=lam0_np)
+#     mu  = csdl.Variable(name=f"{newton_name}:mu",  shape=(1,), value=mu0_np)
+
+#     # ----- SDF values & (safe) normals -----
+#     # A
+#     phiA_a = phi_A(a)                                        # scalar
+#     gA     = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a), (3,))
+#     if normalize_grads:
+#         gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+#         nA      = gA / gA_norm
+#     else:
+#         # still guard the zero-gradient case
+#         scale   = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+#         nA      = gA / scale
+
+#     # B
+#     phiB_b = phi_B(b)                                        # scalar
+#     gB     = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b), (3,))
+#     if normalize_grads:
+#         gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+#         nB      = gB / gB_norm
+#     else:
+#         scale   = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+#         nB      = gB / scale
+
+#     # broadcast λ, μ to 3-vectors
+#     ones3 = csdl.Variable(value=np.ones(3))
+#     lam3  = csdl.reshape(csdl.tensordot(lam, ones3, axes=None), (3,))
+#     mu3   = csdl.reshape(csdl.tensordot(mu,  ones3, axes=None), (3,))
+
+#     # ----- residuals -----
+#     # Surface constraints
+#     RA = csdl.reshape(phiA_a, (1,))                    # φ_A(a) = 0
+#     RB = csdl.reshape(phiB_b, (1,))                    # φ_B(b) = 0
+
+#     # Stationarity with tiny Tikhonov (anchors at seeds)
+#     #   (a - b) + λ nA + reg*(a - a0) = 0
+#     #   (a - b) - μ nB + reg*(b - b0) = 0
+#     RS_A = (a - b) + lam3 * nA + reg_pos * (a - a0_const)   # (3,)
+#     RS_B = (a - b) - mu3  * nB + reg_pos * (b - b0_const)   # (3,)
+
+#     # ----- Newton solve -----
+#     solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
+#     solver.add_state(a,   RS_A, initial_value=a0_np)   # 3 eqs
+#     solver.add_state(b,   RS_B, initial_value=b0_np)   # 3 eqs
+#     solver.add_state(lam, RA,   initial_value=lam0_np) # 1 eq
+#     solver.add_state(mu,  RB,   initial_value=mu0_np)  # 1 eq
+#     solver.run()
+
+#     # ----- outputs -----
+#     diff = a - b
+#     gap  = csdl.sqrt(csdl.vdot(diff, diff) + _eps)
+
+#     # mid-point & smooth max (kept for API compatibility)
+#     x_mid  = 0.5 * (a + b)
+#     F_star = csdl.maximum(phi_A(x_mid), phi_B(x_mid), rho=20.0)
+
+#     if return_all:
+#         return x_mid, F_star, a, b, gap
+#     return gap
+
+
+
+
+
 
 
 
