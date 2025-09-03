@@ -138,3 +138,114 @@ def plot_isosurface_with_collision_points(
         ])
 
     plotter.show()
+
+
+
+def plot_3d_eikonal_violation(
+    phi: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    *,
+    absolute: bool = True,          # plot |‖∇φ‖-1| (True) or signed (‖∇φ‖-1)
+    as_volume: bool = True,         # volume rendering (True) or isosurfaces (False)
+    iso_levels = (0.05, 0.10, 0.20),# isosurface levels for violation (in absolute units)
+    title: str = "Eikonal violation map",
+    cmap: str = "inferno",
+    opacity: float | None = None,   # None: auto ramp for volume
+    edge_order: int = 2,             # 2nd-order finite diff at edges
+    cool: bool = False              # Clear screen for screenshots
+):
+    """
+    Plot a 3D map of the eikonal violation from a gridded SDF φ(x,y,z).
+
+    Parameters
+    ----------
+    phi : (nx, ny, nz) array
+        SDF samples on a rectilinear grid defined by x, y, z.
+    x, y, z : 1D arrays
+        Grid axes (monotone). Uniform spacing assumed for visualization.
+    absolute : bool
+        If True, visualize |‖∇φ‖ - 1|; otherwise visualize ‖∇φ‖ - 1 (signed).
+    as_volume : bool
+        If True, use volume rendering; else show isosurfaces of violation.
+    iso_levels : tuple[float,...]
+        Violation magnitudes to contour when as_volume=False.
+    title : str
+        Plot title.
+    cmap : str
+        Matplotlib colormap name for coloring.
+    opacity : float | None
+        Global mesh opacity for isosurfaces; None lets PyVista decide for volume.
+    edge_order : int
+        Order for np.gradient at edges (1 or 2).
+
+    Returns
+    -------
+    grad_norm : np.ndarray
+        The computed ‖∇φ‖ on the same grid.
+    violation : np.ndarray
+        Either |‖∇φ‖-1| (absolute=True) or (‖∇φ‖-1) (signed).
+    """
+    # --- finite-difference gradient on the rectilinear grid ---
+    dx = float(x[1] - x[0])
+    dy = float(y[1] - y[0])
+    dz = float(z[1] - z[0])
+
+    gx, gy, gz = np.gradient(phi, dx, dy, dz, edge_order=edge_order)
+    grad_norm = np.sqrt(gx*gx + gy*gy + gz*gz)
+
+    # eikonal violation
+    if absolute:
+        violation = np.abs(grad_norm - 1.0)
+        scalars_name = "eikonal_abs"
+    else:
+        violation = grad_norm - 1.0
+        scalars_name = "eikonal_signed"
+
+    # --- build a PyVista uniform grid matching your layout ---
+    grid = pv.ImageData()
+    grid.dimensions = np.array(phi.shape)            # (nx, ny, nz)
+    grid.spacing = (dx, dy, dz)
+    grid.origin = (x[0], y[0], z[0])
+
+    # Important: keep Fortran order to match pv.ImageData memory expectations
+    grid.point_data[scalars_name] = violation.flatten(order="F")
+
+    # Optional: also attach grad_norm if you want to inspect later
+    grid.point_data["grad_norm"] = grad_norm.flatten(order="F")
+
+    if cool == True:
+        scale = False
+    else:
+        scale = True
+
+    # --- visualize ---
+    plotter = pv.Plotter()
+    if as_volume:
+        # Volume render the violation; smaller values -> more transparent
+        # Build a simple opacity transfer if none provided
+        if opacity is None:
+            # Build a simple opacity ramp: transparent at 0, opaque by ~max violation
+            vmax = np.percentile(violation, 99.5)
+            vmax = vmax if vmax > 0 else 1.0
+            opacity = [0.0, 0.2, 0.6, 1.0]   # piecewise values
+        plotter.add_volume(grid, scalars=scalars_name, cmap=cmap, opacity=opacity)
+    else:
+        # Contour specific violation magnitudes (isosurfaces)
+        # Use positive magnitudes even when signed=False
+        levels = np.asarray(iso_levels, float)
+        levels = np.unique(np.abs(levels))
+        if levels.size == 0:
+            levels = np.array([0.1], float)
+        contour = grid.contour(isosurfaces=list(levels), scalars=scalars_name)
+        plotter.add_mesh(contour, cmap=cmap, opacity=opacity if opacity is not None else 0.6, show_scalar_bar = scale)
+
+    if cool == False:
+        plotter.add_axes()
+        plotter.add_title(title)
+        plotter.show()
+    else:
+        plotter.show()
+
+    return grad_norm, violation
