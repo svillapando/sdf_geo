@@ -3,7 +3,7 @@ import csdl_alpha as csdl
 from prism import primitives as prim
 from prism import operations as op
 from prism.visualization import plot_2d_slice, plot_3d_isosurface, plot_isosurface_with_collision_points
-from interference import collision_check
+from interference import collision_check, collision_check_kkt_LM
 
 # --- Controls ---
 SCENARIO = 1          # 1=apart, 2=touching, 3=overlap
@@ -112,15 +112,14 @@ phi_drone = op.union(phi_body, *phi_arms, *rotor_disks)
 # === Obstacle sphere ===
 #r_ball = 0.30
 r_ball = 3.0
-# We'll reference the front-left rotor (index 0) so the scenarios are intuitive
-c_rot_ref = rotor_centers[0]  # [-0.5, 0.5, 0.15]
+c_rot_ref = rotor_centers[0]  
 
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball ),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 15.0),
                           c_rot_ref[1]- (rotor_radius - 5),
-                          c_rot_ref[2]+ 10])
+                          c_rot_ref[2]+ 15])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
     c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball),
@@ -132,7 +131,7 @@ else:
                           c_rot_ref[1],
                           c_rot_ref[2]])
 
-phi_ball = prim.sdf_sphere(center=csdl.Variable(value=c_ball_np), radius=r_ball)
+phi_ball = prim.sdf_sphere(center=c_ball_np, radius=r_ball)
 
 # For visualization: union of drone and ball
 phi_union = op.union(phi_drone, phi_ball)
@@ -145,17 +144,25 @@ eta_max = csdl.Variable(value = 0.3)
 
 # Run
 #result = collision_check(phi_drone, phi_ball, x0, eta_max, return_all=True)
-result = collision_check(phi_drone, phi_ball, x0, return_all=True)
+result = collision_check_kkt_LM(phi_drone, phi_ball, x0, return_all=True)
+# x_star   = result[0].value
+# F_star   = result[1].value
+# a        = result[2].value
+# b        = result[3].value
+# pair_gap = result[4].value
+
 x_star   = result[0].value
-F_star   = result[1].value
-a        = result[2].value
-b        = result[3].value
-pair_gap = result[4].value
+a        = result[1].value
+b        = result[2].value
+lamA     = result[3].value
+lamB     = result[4].value
+#rho      = result[5].value
+pair_gap = result[5].value
 
 
 print(f"Scenario = {SCENARIO}  (1 apart, 2 touching, 3 overlap)")
 print("Stationary point x*:", x_star)
-print("F(x*):", F_star)
+#print("F(x*):", F_star)
 print("Closest point on Drone (A):", a)
 print("Closest point on Ball  (B):", b)
 print("Pair gap distance:", pair_gap)
