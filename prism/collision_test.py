@@ -117,7 +117,7 @@ c_rot_ref = rotor_centers[0]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 12.0),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 12.0),
                           c_rot_ref[1]- (rotor_radius - 5),
                           c_rot_ref[2]+ 10.0])
 elif SCENARIO == 2:

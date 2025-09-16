@@ -14,7 +14,6 @@ def collision_check(
     phi_A: SDF,
     phi_B: SDF,
     x0: Union[np.ndarray, csdl.Variable],
-    eta_max: csdl.Variable,
     *,
     rho: float = 20.0,             # higher = sharper max; start 5–20
     return_all: bool = False,
@@ -45,7 +44,7 @@ def collision_check(
     # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
 
     #for c_i in (0.9, 0.5, 0.25): 
-    c_i = 1.0
+    #c_i = 1.0
 
       # inside each pull iteration
     FA = phi_A(x)
@@ -56,12 +55,12 @@ def collision_check(
     gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
 
     # adaptive step length: eta = min(c * |F|, eta_max)
-    eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+    #eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
 
-    x = x - (eta * gF / gF_norm)
+    x = x - (gF / gF_norm)
 
     xK = x
-    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) -1.5
+    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) -1.0
 
     
     #---- two-step projection to each surface from xK ----
