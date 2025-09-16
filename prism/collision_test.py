@@ -3,7 +3,7 @@ import csdl_alpha as csdl
 from prism import primitives as prim
 from prism import operations as op
 from prism.visualization import plot_2d_slice, plot_3d_isosurface, plot_isosurface_with_collision_points
-from interference import collision_check, collision_check_kkt_LM
+from interference import collision_check
 
 # --- Controls ---
 SCENARIO = 1          # 1=apart, 2=touching, 3=overlap
@@ -117,9 +117,9 @@ c_rot_ref = rotor_centers[0]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 15.0),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 12.0),
                           c_rot_ref[1]- (rotor_radius - 5),
-                          c_rot_ref[2]+ 15])
+                          c_rot_ref[2]+ 10.0])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
     c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball),
@@ -143,45 +143,57 @@ x0 = csdl.Variable(value=x0_mid_np)
 eta_max = csdl.Variable(value = 0.3)
 
 # Run
-#result = collision_check(phi_drone, phi_ball, x0, eta_max, return_all=True)
-result = collision_check_kkt_LM(phi_drone, phi_ball, x0, return_all=True)
-# x_star   = result[0].value
-# F_star   = result[1].value
-# a        = result[2].value
-# b        = result[3].value
-# pair_gap = result[4].value
-
+result = collision_check(phi_drone, phi_ball, x0, eta_max, return_all=True)
+#result = collision_check_kkt_LM(phi_drone, phi_ball, x0, return_all=True)
 x_star   = result[0].value
-a        = result[1].value
-b        = result[2].value
-lamA     = result[3].value
-lamB     = result[4].value
-#rho      = result[5].value
-pair_gap = result[5].value
+F_star   = result[1].value
+a        = result[2].value
+b        = result[3].value
+#pair_gap = result[4].value
+
+# r_eq = result[2].value
+# r_dir = result[3].value
+# r_eik_A = result[4].value
+# r_eik_B = result[5].value
+# a = result[6].value
+# b = result[7].value
+
+# x_star   = result[0].value
+# a        = result[1].value
+# b        = result[2].value
+# #lamA     = result[3].value
+# #lamB     = result[4].value
+# #rho      = result[5].value
+# pair_gap = result[3].value
 
 
 print(f"Scenario = {SCENARIO}  (1 apart, 2 touching, 3 overlap)")
 print("Stationary point x*:", x_star)
-#print("F(x*):", F_star)
-print("Closest point on Drone (A):", a)
-print("Closest point on Ball  (B):", b)
-print("Pair gap distance:", pair_gap)
+print("F(x*):", F_star)
+# print("Equality Residual:", r_eq)
+# print("Normal Direction Res:", r_dir)
+# print("Eikonal Error (A):", r_eik_A)
+# print("Eikonal Error (B):", r_eik_B)
 
-print("phi(drone) at p_drone:", phi_drone(a).value)
-print("phi(env)   at p_env:",   phi_ball(b).value)
+# print("Closest point on Drone (A):", a)
+# print("Closest point on Ball  (B):", b)
+# print("Pair gap distance:", pair_gap)
+
+# print("phi(drone) at p_drone:", phi_drone(a).value)
+# print("phi(env)   at p_env:",   phi_ball(b).value)
 
 # === Visualize ===
 xg, yg, zg, P = make_grid(-30.0, 30.0, GRID_N)
 phi_val = phi_union(P).value  # evaluate on grid
-test = csdl.Variable(shape=(3,), value=np.array([1.0, 0.0, 0.0]))  # pick a test point
-phi_test = phi_drone(test)                                          # scalar
-g        = csdl.reshape(csdl.derivative(ofs=phi_test, wrts=test), (3,))
-eikonal  = csdl.norm(g)
-print("‖∇phi‖ =", eikonal.value)
-phi_env_test = phi_ball(test)                                          # scalar
-g_env        = csdl.reshape(csdl.derivative(ofs=phi_env_test, wrts=test), (3,))
-eikonal_env  = csdl.norm(g_env)
-print("‖∇phi_env‖ =", eikonal_env.value)
+# test = csdl.Variable(shape=(3,), value=np.array([1.0, 0.0, 0.0]))  # pick a test point
+# phi_test = phi_drone(test)                                          # scalar
+# g        = csdl.reshape(csdl.derivative(ofs=phi_test, wrts=test), (3,))
+# eikonal  = csdl.norm(g)
+# print("‖∇phi‖ =", eikonal.value)
+# phi_env_test = phi_ball(test)                                          # scalar
+# g_env        = csdl.reshape(csdl.derivative(ofs=phi_env_test, wrts=test), (3,))
+# eikonal_env  = csdl.norm(g_env)
+# print("‖∇phi_env‖ =", eikonal_env.value)
 if PLOT:
     #plot_2d_slice(phi_val, xg, yg, title=f"Drone ∪ Ball (scenario={SCENARIO})")
     #plot_3d_isosurface(phi_val, xg, yg, zg)

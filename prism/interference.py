@@ -9,291 +9,341 @@ SDF = Callable[[csdl.Variable], csdl.Variable]
 
 _DEF_EPS = 1e-12
 
-# # Collision check similar to paper
-# def collision_check(
-#     phi_A: SDF,
-#     phi_B: SDF,
-#     x0: Union[np.ndarray, csdl.Variable],
-#     eta_max: csdl.Variable,
-#     *,
-#     rho: float = 20.0,             # higher = sharper max; start 5–20
-#     return_all: bool = False,
-#     newton_name: str = "collision_check_smooth",
-# ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
-#     """
-#     Differentiable SDF-SDF proximity/collision check
-
-#     Steps:
-#       1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
-#       2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
-#       3) Project once from x_K to each surface:
-#            a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
-#            b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
-#       4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
-#          and optionally x_K, a, b.
-
-#     Returns:
-#       If return_all: (x_K, F_star, a, b, gap), else just F.
-#     """
-#     # ---- seed x0 as leaf variable ----
-#     if isinstance(x0, csdl.Variable):
-#         x0_np = np.asarray(x0.value, float).reshape(3,)
-#     else:
-#         x0_np = np.asarray(x0, float).reshape(3,)
-#     x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
-
-#     # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
-
-#     for c_i in (0.9, 0.5, 0.25): 
-#     #for c_i in (0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7):
-
-#       # inside each pull iteration
-#         FA = phi_A(x)
-#         FB = phi_B(x)
-#         F  = csdl.maximum(FA, FB, rho=rho)
-
-#         gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
-#         gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
-
-#         # adaptive step length: eta = min(c * |F|, eta_max)
-#         eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
-
-#         x = x - (eta * gF / gF_norm)
- 
-#     xK = x
-#     F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho)
-
-
-#     #---- two-step projection to each surface from xK ----
-#     if return_all:
-#         # A
-#         FA = phi_A(xK)
-#         gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
-#         gA_n = csdl.norm(gA) + _DEF_EPS
-#         a1 = xK - (FA / (gA_n * gA_n)) * gA
-
-#         FA = phi_A(a1)
-#         gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=a1), (3,))
-#         gA_n = csdl.norm(gA) + _DEF_EPS
-#         a = a1 - (FA / (gA_n * gA_n)) * gA
-
-#         # B
-#         FB = phi_B(xK)
-#         gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
-#         gB_n = csdl.norm(gB) + _DEF_EPS
-#         b1 = xK - (FB / (gB_n * gB_n)) * gB
-
-#         FB = phi_B(b1)
-#         gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=b1), (3,))
-#         gB_n = csdl.norm(gB) + _DEF_EPS
-#         b = b1 - (FB / (gB_n * gB_n)) * gB
-
-
-#         # ---- outputs ----
-#         diff = a - b
-#         gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)  # Euclidean pair gap ≥ 0
-    
-#         # === equal-distance snap of xK, then one reproject ===
-#         def sgn_smooth(x, eps=_DEF_EPS):
-#         # smooth sign ≈ x / (|x| + eps)
-#             return x / (csdl.absolute(x) + eps)
-
-#         # normals at the projected points
-#         FAa = phi_A(a); gA_a = csdl.reshape(csdl.derivative(ofs=FAa, wrts=a), (3,))
-#         FBb = phi_B(b); gB_b = csdl.reshape(csdl.derivative(ofs=FBb, wrts=b), (3,))
-#         na   = gA_a / (csdl.norm(gA_a) + _DEF_EPS)
-#         nb   = gB_b / (csdl.norm(gB_b) + _DEF_EPS)
-
-#         # orient normals smoothly to point toward each other across the gap
-#         d     = a - b                          # segment from B→A
-#         na_o  = sgn_smooth(csdl.vdot(d, na)) * na
-#         nb_o  = sgn_smooth(csdl.vdot(-d, nb)) * nb
-
-#         # distances from xK to each surface along the oriented normals
-#         tA = csdl.minimum(csdl.vdot(xK - a, na_o))
-#         tB = csdl.minimum(csdl.vdot(b  - xK, nb_o))
-#         t  = 0.5 * (tA + tB)                   # force equal distance
-
-#         # snap x to the equal-distance point along normals
-#         xK = 0.5 * (a + t*na_o + b - t*nb_o)
-
-#         # reproject once from the snapped midpoint (cheap & effective)
-#         FA = phi_A(xK); gA = csdl.reshape(csdl.derivative(ofs=FA, wrts=xK), (3,))
-#         a  = xK - (FA * gA) / (csdl.vdot(gA, gA) + _DEF_EPS)
-
-#         FB = phi_B(xK); gB = csdl.reshape(csdl.derivative(ofs=FB, wrts=xK), (3,))
-#         b  = xK - (FB * gB) / (csdl.vdot(gB, gB) + _DEF_EPS)
-
-
-#     if return_all:
-#         gap = csdl.norm(a - b)
-#         return xK, F_star, a, b, gap
-#     return F_star, xK
-
-
-
-
-
-# It works?? Substitute lagrange multipliers
+# Collision check similar to paper
 def collision_check(
     phi_A: SDF,
     phi_B: SDF,
     x0: Union[np.ndarray, csdl.Variable],
+    eta_max: csdl.Variable,
     *,
-    newton_tol: float = 1e-8,
-    newton_name: str = "collision_check_stationarity",
+    rho: float = 20.0,             # higher = sharper max; start 5–20
     return_all: bool = False,
-    normalize_grads: bool = True,
-    grad_floor: float = 1e-8,        # guard for ||∇φ||
-    reg_pos: float = 1e-6,           # tiny Tikhonov regularization (anchors at seeds)
-    surf_weight: float = 1.0,        # penalty strength pushing a,b to their surfaces
-    beta_scale_with_grad: bool = True # scale penalty by ||∇φ|| if not normalizing
-) -> tuple[csdl.Variable, ...] | csdl.Variable:
+    newton_name: str = "collision_check_smooth",
+) -> Tuple[csdl.Variable, ...] | csdl.Variable:
+    """
+    Differentiable SDF-SDF proximity/collision check
 
-    # ----- numeric seeds -----
-    try:
+    Steps:
+      1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
+      2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
+      3) Project once from x_K to each surface:
+           a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
+           b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
+      4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
+         and optionally x_K, a, b.
+
+    Returns:
+      If return_all: (x_K, F_star, a, b, gap), else just F.
+    """
+    # ---- seed x0 as leaf variable ----
+    if isinstance(x0, csdl.Variable):
         x0_np = np.asarray(x0.value, float).reshape(3,)
-    except AttributeError:
+    else:
         x0_np = np.asarray(x0, float).reshape(3,)
+    x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
 
-    a0_np = x0_np.copy()
-    b0_np = x0_np.copy()
+    # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
 
-    # constants / guards
-    _eps = 1e-12
+    #for c_i in (0.9, 0.5, 0.25): 
+    c_i = 1.0
 
-    # keep copies of the seeds as constants for regularization anchors
-    a0_const = csdl.Variable(value=a0_np)
-    b0_const = csdl.Variable(value=b0_np)
+      # inside each pull iteration
+    FA = phi_A(x)
+    FB = phi_B(x)
+    F  = csdl.maximum(FA, FB, rho=rho)
 
-    ones3 = csdl.Variable(value=np.ones(3))
+    gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
+    gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
 
-    # ----- states (only a and b) -----
-    a = csdl.Variable(name=f"{newton_name}:a", shape=(3,), value=a0_np)
-    b = csdl.Variable(name=f"{newton_name}:b", shape=(3,), value=b0_np)
+    # adaptive step length: eta = min(c * |F|, eta_max)
+    eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
 
-    # ----- SDF values & (safe) normals -----
-    # A
-    phiA_a = phi_A(a)                                       # scalar
-    gA     = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a), (3,))
-    if normalize_grads:
-        gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
-        nA      = gA / gA_norm
-        betaA   = surf_weight
-    else:
-        # still guard the zero-gradient case
-        gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
-        nA      = gA / gA_norm
-        betaA   = surf_weight * (gA_norm if beta_scale_with_grad else 1.0)
+    x = x - (eta * gF / gF_norm)
 
-    # B
-    phiB_b = phi_B(b)                                       # scalar
-    gB     = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b), (3,))
-    if normalize_grads:
-        gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
-        nB      = gB / gB_norm
-        betaB   = surf_weight
-    else:
-        gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
-        nB      = gB / gB_norm
-        betaB   = surf_weight * (gB_norm if beta_scale_with_grad else 1.0)
+    xK = x
+    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) -1.5
 
-    # Reshape scalars for vector scaling
-    phiA_as3 = csdl.reshape(phiA_a, (1,)) * ones3
-    phiB_as3 = csdl.reshape(phiB_b, (1,)) * ones3
+    
+    #---- two-step projection to each surface from xK ----
+    if return_all:
+        # ---------- helpers: safe L2 norm and unit ----------
+        def safe_norm2(v, eps=_DEF_EPS):
+            ax = csdl.absolute(v)
+            vmax01 = csdl.maximum(ax[0], ax[1])
+            vmax   = csdl.maximum(vmax01, ax[2])            # max(|v_i|)
+            scale  = csdl.maximum(vmax, csdl.Variable(value = 1.0))                # keep >= 1 to avoid div-by-zero
+            v_sc   = v / scale
+            return scale * csdl.sqrt(csdl.vdot(v_sc, v_sc) + eps)
 
-    # ----- residuals (penalized stationarity, no λ/μ states) -----
-    # Intuition: original KKT had (a - b) + λ nA = 0, (a - b) - μ nB = 0 with φ_A(a)=0, φ_B(b)=0.
-    # Here we replace λ ≈ -β φ_A(a), μ ≈  β φ_B(b), which pushes a,b to their surfaces and couples them.
-    RS_A = (a - b) + betaA * (phiA_as3 * nA) + reg_pos * (a - a0_const)  # (3,)
-    RS_B = (a - b) - betaB * (phiB_as3 * nB) + reg_pos * (b - b0_const)  # (3,)
+        def safe_unit(v, eps=_DEF_EPS):
+            return v / (safe_norm2(v, eps) + eps)
 
-    # ----- Newton solve -----
-    solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
-    # (Optional) If your CSDL build supports it, you can also set a safe max iters, damping, etc.
-    # e.g., solver.options['max_iter'] = 80
-    solver.add_state(a, RS_A, initial_value=a0_np)   # 3 eqs
-    solver.add_state(b, RS_B, initial_value=b0_np)   # 3 eqs
-    solver.run()
+        # ---- keep a copy of the candidate x* for residuals ----
+        x_cand = xK
+        np.set_printoptions(precision=6, suppress=True)
 
-    # ---------- helpers (shape-safe) ----------
-    def _snap_once(p, phi, grad_floor=1e-8):
-        # One Newton projection step: p <- p - φ * n, with unit-normal and floor
-        val = phi(p)                                              # scalar
-        g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
-        n   = g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
-        return p - csdl.reshape(val, (1,)) * n                    # (3,)
+        def _inf_norm(u):      # for numpy arrays (after .value)
+            return float(np.max(np.abs(u)))
 
-    def _snap_k(p0, phi, k=2, grad_floor=1e-8):
-        p = p0
-        for _ in range(k):
-            p = _snap_once(p, phi, grad_floor)
-        return p
 
-    def _unit(v, eps=1e-12):
-        return v / (csdl.sqrt(csdl.vdot(v, v)) + eps)
+        x_cand = xK
 
-    def _normal_at(p, phi, grad_floor=1e-8):
-        val = phi(p)  # scalar (unused; ensures correct graph deps)
-        g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
-        return g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
+        # ===== A: first projection step =====
+        print("[PIN] before phi_A(x)")
+        FA0 = phi_A(x_cand)
+        print("[PIN] after  phi_A(x) | FA(x)=", float(FA0.value))
 
-    # ---------- alternating-projection refinement ----------
-    # Idea: land each point on the hemisphere facing the *other* body by projecting
-    # from the other body’s point. Do both orders and keep the better one.
+        print("[PIN] before gradA(x)")
+        gA0 = csdl.reshape(csdl.derivative(ofs=FA0, wrts=x_cand), (3,))
+        print("[PIN] after  gradA(x) | max|gA|=", float(np.max(np.abs(gA0.value))))
 
-    # Option A: start from b toward A, then from a toward B (B→A→B)
-    a_A1 = _snap_k(b, phi_A, k=2, grad_floor=grad_floor)         # project B's point onto A
-    b_A1 = _snap_k(a_A1, phi_B, k=2, grad_floor=grad_floor)      # then project that onto B
+        gA0n = safe_norm2(gA0) + _DEF_EPS
+        sA   = csdl.absolute(FA0) / gA0n
+        a1   = x_cand - (FA0 * gA0) / (gA0n * gA0n)
 
-    # Option B: start from a toward B, then from b toward A (A→B→A)
-    b_B1 = _snap_k(a, phi_B, k=2, grad_floor=grad_floor)
-    a_B1 = _snap_k(b_B1, phi_A, k=2, grad_floor=grad_floor)
+        print("[DBG] A0  | FA(x)       =", float(FA0.value),
+                "||gA||    =", float(gA0n.value),
+                "max|gA|   =", float(np.max(np.abs(gA0.value))),
+                "step      =", float(sA.value),
+                "||x||inf  =", _inf_norm(x_cand.value),
+                "||a1||inf =", _inf_norm(a1.value))
 
-    # Score both candidates by (i) smaller gap and (ii) better normal alignment
-    def _score_pair(aP, bP, phiA, phiB):
-        t   = _unit(aP - bP)
-        nA  = _normal_at(aP, phiA, grad_floor)
-        nB  = _normal_at(bP, phiB, grad_floor)
-        gap = csdl.sqrt(csdl.vdot(aP - bP, aP - bP) + 1e-12)
-        # alignment: both outward normals should align with chord (>=0, closer to 1 is better)
-        align = 0.5 * (csdl.vdot(nA, t) + csdl.vdot(nB, t))       # scalar
-        return gap, align
+        # This call is a common overflow point if a1 jumped far:
+        FA1 = phi_A(a1)
+        print("[DBG] A1  | FA(a1)      =", float(FA1.value))
 
-    gap_A, align_A = _score_pair(a_A1, b_A1, phi_A, phi_B)
-    gap_B, align_B = _score_pair(a_B1, b_B1, phi_A, phi_B)
+        # ===== A: second projection step =====
+        gA1  = csdl.reshape(csdl.derivative(ofs=FA1, wrts=a1), (3,))
+        gA1n = safe_norm2(gA1) + _DEF_EPS
+        a    = a1 - (FA1 * gA1) / (gA1n * gA1n)
 
-    # Choose the better pair: prefer smaller gap; break ties by larger alignment
-    # (CSDL has no conditionals; pick both and *use the one you return* in Python flow)
-    use_A = True  # Python-level choice is fine since you're building the graph once per call
-    # You can fetch initial seeds’ numpy to decide, but simplest is:
-    #   if you want fully CSDL, keep both and return both to caller to choose.
-    try:
-        # If shapes were numeric Variables, take a quick numpy read for the decision:
-        use_A = (float(gap_A.value) < float(gap_B.value)) or \
-                (abs(float(gap_A.value) - float(gap_B.value)) < 1e-9 and float(align_A.value) >= float(align_B.value))
-    except Exception:
-        # Fallback: prefer A by default
-        use_A = True
+        print("[DBG] A2  | ||gA(a1)||  =", float(gA1n.value),
+                "max|gA(a1)|=", float(np.max(np.abs(gA1.value))),
+                "||a||inf   =", _inf_norm(a.value))
 
-    a_ref = a_A1 if use_A else a_B1
-    b_ref = b_A1 if use_A else b_B1
+        # ===== B: first projection step =====
+        FB0  = phi_B(x_cand)
+        gB0  = csdl.reshape(csdl.derivative(ofs=FB0, wrts=x_cand), (3,))
+        gB0n = safe_norm2(gB0) + _DEF_EPS
+        sB   = csdl.absolute(FB0) / gB0n
+        b1   = x_cand - (FB0 * gB0) / (gB0n * gB0n)
 
-    # # Optional tiny clean-up snap to ensure |φ| ~ 0 after the alternations
-    # a_ref = _snap_once(a_ref, phi_A, grad_floor)
-    # b_ref = _snap_once(b_ref, phi_B, grad_floor)
+        print("[DBG] B0  | FB(x)       =", float(FB0.value),
+                "||gB||    =", float(gB0n.value),
+                "max|gB|   =", float(np.max(np.abs(gB0.value))),
+                "step      =", float(sB.value),
+                "||x||inf  =", _inf_norm(x_cand.value),
+                "||b1||inf =", _inf_norm(b1.value))
 
-    # ---------- replace outputs ----------
-    a = a_ref
-    b = b_ref
-    diff = a - b
-    gap  = csdl.sqrt(csdl.vdot(diff, diff) + 1e-12)
-    x_mid  = 0.5 * (a + b)
-    F_star = csdl.maximum(phi_A(x_mid), phi_B(x_mid), rho=20.0)- 0.07
+        # Another common overflow point:
+        FB1 = phi_B(b1)
+        print("[DBG] B1  | FB(b1)      =", float(FB1.value))
+
+        # ===== B: second projection step =====
+        gB1  = csdl.reshape(csdl.derivative(ofs=FB1, wrts=b1), (3,))
+        gB1n = safe_norm2(gB1) + _DEF_EPS
+        b    = b1 - (FB1 * gB1) / (gB1n * gB1n)
+
+        print("[DBG] B2  | ||gB(b1)||  =", float(gB1n.value),
+                "max|gB(b1)|=", float(np.max(np.abs(gB1.value))),
+                "||b||inf   =", _inf_norm(b.value))
+
+        # ---- gap (optional) ----
+        diff = a - b
+        gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
+        print("[DBG] GAP | ||a-b||     =", float(gap.value))
+
+        # ===== residuals =====
+        FA_x = phi_A(x_cand); FB_x = phi_B(x_cand)
+        r_eq = csdl.absolute(FA_x - FB_x)
+        print("[DBG] EQ  | |FA-FB|     =", float(r_eq.value))
+
+        FA_a = phi_A(a); gA_a = csdl.reshape(csdl.derivative(ofs=FA_a, wrts=a), (3,))
+        FB_b = phi_B(b); gB_b = csdl.reshape(csdl.derivative(ofs=FB_b, wrts=b), (3,))
+        nA   = gA_a / (safe_norm2(gA_a) + _DEF_EPS)
+        nB   = gB_b / (safe_norm2(gB_b) + _DEF_EPS)
+
+        print("[DBG] NRM | ||gA(a)||   =", float(safe_norm2(gA_a).value),
+                "||gB(b)|| =", float(safe_norm2(gB_b).value),
+                "max|gA(a)|=", float(np.max(np.abs(gA_a.value))),
+                "max|gB(b)|=", float(np.max(np.abs(gB_b.value))))
+
+        r_dir = 0.5 * safe_norm2(nA + nB)
+        print("[DBG] DIR | r_dir       =", float(r_dir.value))
+
+        r_eik_A = csdl.absolute(safe_norm2(gA_a) - 1.0)
+        r_eik_B = csdl.absolute(safe_norm2(gB_b) - 1.0)
+        print("[DBG] EIK | A=", float(r_eik_A.value), "B=", float(r_eik_B.value))
+
 
     if return_all:
-        return x_mid, F_star, a, b, gap
-    return gap
+        return xK, F_star, a, b
+    return xK, F_star
+
+
+
+
+
+# # It works?? Substitute lagrange multipliers
+# def collision_check(
+#     phi_A: SDF,
+#     phi_B: SDF,
+#     x0: Union[np.ndarray, csdl.Variable],
+#     *,
+#     newton_tol: float = 1e-8,
+#     newton_name: str = "collision_check_stationarity",
+#     return_all: bool = False,
+#     normalize_grads: bool = True,
+#     grad_floor: float = 1e-8,        # guard for ||∇φ||
+#     reg_pos: float = 1e-6,           # tiny Tikhonov regularization (anchors at seeds)
+#     surf_weight: float = 1.0,        # penalty strength pushing a,b to their surfaces
+#     beta_scale_with_grad: bool = True # scale penalty by ||∇φ|| if not normalizing
+# ) -> tuple[csdl.Variable, ...] | csdl.Variable:
+
+#     # ----- numeric seeds -----
+#     try:
+#         x0_np = np.asarray(x0.value, float).reshape(3,)
+#     except AttributeError:
+#         x0_np = np.asarray(x0, float).reshape(3,)
+
+#     a0_np = x0_np.copy()
+#     b0_np = x0_np.copy()
+
+#     # constants / guards
+#     _eps = 1e-12
+
+#     # keep copies of the seeds as constants for regularization anchors
+#     a0_const = csdl.Variable(value=a0_np)
+#     b0_const = csdl.Variable(value=b0_np)
+
+#     ones3 = csdl.Variable(value=np.ones(3))
+
+#     # ----- states (only a and b) -----
+#     a = csdl.Variable(name=f"{newton_name}:a", shape=(3,), value=a0_np)
+#     b = csdl.Variable(name=f"{newton_name}:b", shape=(3,), value=b0_np)
+
+#     # ----- SDF values & (safe) normals -----
+#     # A
+#     phiA_a = phi_A(a)                                       # scalar
+#     gA     = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a), (3,))
+#     if normalize_grads:
+#         gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+#         nA      = gA / gA_norm
+#         betaA   = surf_weight
+#     else:
+#         # still guard the zero-gradient case
+#         gA_norm = csdl.sqrt(csdl.vdot(gA, gA) + grad_floor)
+#         nA      = gA / gA_norm
+#         betaA   = surf_weight * (gA_norm if beta_scale_with_grad else 1.0)
+
+#     # B
+#     phiB_b = phi_B(b)                                       # scalar
+#     gB     = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b), (3,))
+#     if normalize_grads:
+#         gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+#         nB      = gB / gB_norm
+#         betaB   = surf_weight
+#     else:
+#         gB_norm = csdl.sqrt(csdl.vdot(gB, gB) + grad_floor)
+#         nB      = gB / gB_norm
+#         betaB   = surf_weight * (gB_norm if beta_scale_with_grad else 1.0)
+
+#     # Reshape scalars for vector scaling
+#     phiA_as3 = csdl.reshape(phiA_a, (1,)) * ones3
+#     phiB_as3 = csdl.reshape(phiB_b, (1,)) * ones3
+
+#     # ----- residuals (penalized stationarity, no λ/μ states) -----
+#     # Intuition: original KKT had (a - b) + λ nA = 0, (a - b) - μ nB = 0 with φ_A(a)=0, φ_B(b)=0.
+#     # Here we replace λ ≈ -β φ_A(a), μ ≈  β φ_B(b), which pushes a,b to their surfaces and couples them.
+#     RS_A = (a - b) + betaA * (phiA_as3 * nA) + reg_pos * (a - a0_const)  # (3,)
+#     RS_B = (a - b) - betaB * (phiB_as3 * nB) + reg_pos * (b - b0_const)  # (3,)
+
+#     # ----- Newton solve -----
+#     solver = csdl.nonlinear_solvers.Newton(newton_name, tolerance=newton_tol)
+#     # (Optional) If your CSDL build supports it, you can also set a safe max iters, damping, etc.
+#     # e.g., solver.options['max_iter'] = 80
+#     solver.add_state(a, RS_A, initial_value=a0_np)   # 3 eqs
+#     solver.add_state(b, RS_B, initial_value=b0_np)   # 3 eqs
+#     solver.run()
+
+#     # ---------- helpers (shape-safe) ----------
+#     def _snap_once(p, phi, grad_floor=1e-8):
+#         # One Newton projection step: p <- p - φ * n, with unit-normal and floor
+#         val = phi(p)                                              # scalar
+#         g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
+#         n   = g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
+#         return p - csdl.reshape(val, (1,)) * n                    # (3,)
+
+#     def _snap_k(p0, phi, k=2, grad_floor=1e-8):
+#         p = p0
+#         for _ in range(k):
+#             p = _snap_once(p, phi, grad_floor)
+#         return p
+
+#     def _unit(v, eps=1e-12):
+#         return v / (csdl.sqrt(csdl.vdot(v, v)) + eps)
+
+#     def _normal_at(p, phi, grad_floor=1e-8):
+#         val = phi(p)  # scalar (unused; ensures correct graph deps)
+#         g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p), (3,))
+#         return g / csdl.sqrt(csdl.vdot(g, g) + grad_floor)
+
+#     # ---------- alternating-projection refinement ----------
+#     # Idea: land each point on the hemisphere facing the *other* body by projecting
+#     # from the other body’s point. Do both orders and keep the better one.
+
+#     # Option A: start from b toward A, then from a toward B (B→A→B)
+#     a_A1 = _snap_k(b, phi_A, k=2, grad_floor=grad_floor)         # project B's point onto A
+#     b_A1 = _snap_k(a_A1, phi_B, k=2, grad_floor=grad_floor)      # then project that onto B
+
+#     # Option B: start from a toward B, then from b toward A (A→B→A)
+#     b_B1 = _snap_k(a, phi_B, k=2, grad_floor=grad_floor)
+#     a_B1 = _snap_k(b_B1, phi_A, k=2, grad_floor=grad_floor)
+
+#     # Score both candidates by (i) smaller gap and (ii) better normal alignment
+#     def _score_pair(aP, bP, phiA, phiB):
+#         t   = _unit(aP - bP)
+#         nA  = _normal_at(aP, phiA, grad_floor)
+#         nB  = _normal_at(bP, phiB, grad_floor)
+#         gap = csdl.sqrt(csdl.vdot(aP - bP, aP - bP) + 1e-12)
+#         # alignment: both outward normals should align with chord (>=0, closer to 1 is better)
+#         align = 0.5 * (csdl.vdot(nA, t) + csdl.vdot(nB, t))       # scalar
+#         return gap, align
+
+#     gap_A, align_A = _score_pair(a_A1, b_A1, phi_A, phi_B)
+#     gap_B, align_B = _score_pair(a_B1, b_B1, phi_A, phi_B)
+
+#     # Choose the better pair: prefer smaller gap; break ties by larger alignment
+#     # (CSDL has no conditionals; pick both and *use the one you return* in Python flow)
+#     use_A = True  # Python-level choice is fine since you're building the graph once per call
+#     # You can fetch initial seeds’ numpy to decide, but simplest is:
+#     #   if you want fully CSDL, keep both and return both to caller to choose.
+#     try:
+#         # If shapes were numeric Variables, take a quick numpy read for the decision:
+#         use_A = (float(gap_A.value) < float(gap_B.value)) or \
+#                 (abs(float(gap_A.value) - float(gap_B.value)) < 1e-9 and float(align_A.value) >= float(align_B.value))
+#     except Exception:
+#         # Fallback: prefer A by default
+#         use_A = True
+
+#     a_ref = a_A1 if use_A else a_B1
+#     b_ref = b_A1 if use_A else b_B1
+
+#     # # Optional tiny clean-up snap to ensure |φ| ~ 0 after the alternations
+#     # a_ref = _snap_once(a_ref, phi_A, grad_floor)
+#     # b_ref = _snap_once(b_ref, phi_B, grad_floor)
+
+#     # ---------- replace outputs ----------
+#     a = a_ref
+#     b = b_ref
+#     diff = a - b
+#     gap  = csdl.sqrt(csdl.vdot(diff, diff) + 1e-12)
+#     x_mid  = 0.5 * (a + b)
+#     F_star = csdl.maximum(phi_A(x_mid), phi_B(x_mid), rho=20.0)- 0.07
+
+#     if return_all:
+#         return x_mid, F_star, a, b, gap
+#     return gap
 
 
 
@@ -644,153 +694,230 @@ def collision_check(
 # __all__ = [
 #     "collision_check_kkt",
 # ]
-def collision_check_kkt_LM(
-    phi_A: SDF,
-    phi_B: SDF,
-    x0: Union[np.ndarray, csdl.Variable],
-    *,
-    max_iter: int = 60,
-    tol: float = 1e-10,
-    mu0: float = 1e-2,       # initial LM damping
-    mu_inc: float = 10.0,    # if step rejected: mu <- mu * mu_inc
-    mu_dec: float = 1/3.0,   # if step accepted: mu <- max(mu*mu_dec, 1e-15)
-    return_all: bool = False,
-):
-    """Levenberg–Marquardt on the textbook KKT residuals (8 unknowns).
-       Unknowns: a(3), b(3), lamA(1), lamB(1)
-       Residuals:
-         R1 = (a - b) + lamA * grad(phi_A)(a)      (3)
-         R2 = -(a - b) + lamB * grad(phi_B)(b)     (3)
-         R3 = phi_A(a)                              (1)
-         R4 = phi_B(b)                              (1)
-    """
-    # ---- numeric seeds ----
-    try:
-        x0_np = np.asarray(x0.value, float).reshape(3,)
-    except AttributeError:
-        x0_np = np.asarray(x0, float).reshape(3,)
-    a = x0_np.copy()
-    b = x0_np.copy()
-    lamA = np.array([0.0], dtype=float)
-    lamB = np.array([0.0], dtype=float)
 
-    mu = float(mu0)
+# # ------------------------------------------------------------
+# # Two-phase collision solve with feasibility weighting
+# # Phase 1: LM projection to each surface (gets |phi| ~ 0)
+# # Phase 2: KKT LM with weighted feasibility (robust from far seeds)
+# # ------------------------------------------------------------
 
-    # Basis vectors to extract residual components without array indexing
-    def basis(i):
-        e = np.zeros(3, dtype=float); e[i] = 1.0
-        return csdl.Variable(value=e)
+# def collision_check_kkt_LM(
+#     phi_A, phi_B, x0,
+#     *,
+#     # Phase-1 (projection) LM settings
+#     proj_max_iter: int = 40,
+#     proj_tol: float = 1e-12,
+#     # Phase-2 (KKT) LM settings
+#     kkt_max_iter: int = 80,
+#     kkt_tol: float = 1e-12,
+#     lm_mu0: float = 1e-2,
+#     lm_mu_inc: float = 10.0,
+#     lm_mu_dec: float = 1/3,
+#     lm_eta: float = 1e-3,             # gain ratio acceptance threshold
+#     # Feasibility weighting schedule (for Phase-2)
+#     feas_weight_init: float = 50.0,    # start heavy so φ-terms dominate when far
+#     feas_weight_decay: float = 0.5,    # multiply weight by this each schedule step
+#     feas_taper_threshold: float = 1e-3,# once max(|φ|) below this, set weight=1
+#     feas_schedule_steps: int = 3,      # how many weighted passes before w=1
+#     # Misc
+#     return_all: bool = False
+# ):
+#     """
+#     Returns: gap (default)
+#              or (x_mid, a, b, gap) if return_all=True
+#     """
 
-    def eval_F_and_J(a_np, b_np, lamA_np, lamB_np):
-        """Build residuals in CSDL, then pull numeric F and J row-by-row."""
-        # Wrap current state as Variables
-        a_v    = csdl.Variable(value=a_np.reshape(3,))
-        b_v    = csdl.Variable(value=b_np.reshape(3,))
-        lamA_v = csdl.Variable(value=lamA_np.reshape(1,))
-        lamB_v = csdl.Variable(value=lamB_np.reshape(1,))
+#     # ---------- utils to extract numpy ----------
+#     def _to_np(x, shape):
+#         try:
+#             return np.asarray(x.value, float).reshape(*shape)
+#         except Exception:
+#             return np.asarray(x, float).reshape(*shape)
 
-        # SDF values and gradients
-        phiA_a = phi_A(a_v)  # scalar
-        gA     = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a_v), (3,))
-        phiB_b = phi_B(b_v)  # scalar
-        gB     = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b_v), (3,))
+#     # ---------- Phase-1: LM projection to a surface ----------
+#     def _lm_project(phi, p0_np):
+#         mu = float(lm_mu0)
+#         p = p0_np.copy()
 
-        diff = a_v - b_v  # (3,)
+#         def FJ(p_np):
+#             p_v = csdl.Variable(value=p_np.reshape(3,))
+#             val = phi(p_v)                                        # scalar
+#             g   = csdl.reshape(csdl.derivative(ofs=val, wrts=p_v),(3,))
+#             F   = np.array([float(val.value)], float)             # (1,)
+#             J   = np.zeros((1,3), float); J[0,:] = _to_np(g,(3,))
+#             return F, J
 
-        R1 = diff + csdl.reshape(lamA_v, (1,)) * gA   # (3,)
-        R2 = -diff + csdl.reshape(lamB_v, (1,)) * gB  # (3,)
-        R3 = phiA_a                                   # (1,)
-        R4 = phiB_b                                   # (1,)
+#         F, J = FJ(p); f2 = float(F @ F)
+#         for _ in range(proj_max_iter):
+#             JTJ = J.T @ J
+#             g = J.T @ F
+#             try:
+#                 dp = -np.linalg.solve(JTJ + mu*np.eye(3), g).reshape(3,)
+#             except np.linalg.LinAlgError:
+#                 mu *= lm_mu_inc; continue
+#             p_trial = p + dp
+#             F_trial, J_trial = FJ(p_trial); f2_trial = float(F_trial @ F_trial)
 
-        # Assemble numeric residual vector F (8,)
-        F = np.zeros(8, dtype=float)
-        # R1 components
-        for i in range(3):
-            ri = csdl.vdot(basis(i), R1)
-            F[i] = float(ri.value)
-        # R2 components
-        for i in range(3):
-            ri = csdl.vdot(basis(i), R2)
-            F[3 + i] = float(ri.value)
-        # R3, R4
-        F[6] = float(R3.value)
-        F[7] = float(R4.value)
+#             # predicted reduction (quadratic model on 1D residual)
+#             pred_red = - (dp @ g).item() - 0.5 * (dp @ (JTJ @ dp)).item()
+#             rho = (f2 - f2_trial) / max(pred_red, 1e-16)
 
-        # Build Jacobian J (8x8) wrt [a(3), b(3), lamA, lamB]
-        J = np.zeros((8, 8), dtype=float)
+#             if rho > lm_eta and f2_trial < f2:
+#                 p, F, J, f2 = p_trial, F_trial, J_trial, f2_trial
+#                 mu = max(mu * lm_mu_dec, 1e-15)
+#                 if f2 < proj_tol: break
+#             else:
+#                 mu *= lm_mu_inc
+#         return p
 
-        # Helper to append gradients for a scalar residual r
-        def fill_row(row_idx, r_scalar):
-            da = csdl.derivative(ofs=r_scalar, wrts=a_v)               # (3,)
-            db = csdl.derivative(ofs=r_scalar, wrts=b_v)               # (3,)
-            dlamA = csdl.derivative(ofs=r_scalar, wrts=lamA_v)         # (1,)
-            dlamB = csdl.derivative(ofs=r_scalar, wrts=lamB_v)         # (1,)
-            J[row_idx, 0:3] = np.asarray(da.value, float).reshape(3,)
-            J[row_idx, 3:6] = np.asarray(db.value, float).reshape(3,)
-            J[row_idx, 6]   = float(dlamA.value)
-            J[row_idx, 7]   = float(dlamB.value)
+#     # ---------- Phase-2: weighted KKT LM (one run) ----------
+#     # Unknowns: a(3), b(3), lamA(1), lamB(1) -> x in R^8
+#     def _kkt_LM(a_seed_np, b_seed_np, w_phi: float, max_iter: int, tol: float):
+#         def pack(a, b, lamA, lamB):
+#             x = np.zeros(8, float)
+#             x[0:3] = a; x[3:6] = b; x[6] = lamA[0]; x[7] = lamB[0]
+#             return x
+#         def unpack(x):
+#             return x[0:3], x[3:6], np.array([x[6]]), np.array([x[7]])
 
-        # R1 rows
-        for i in range(3):
-            ri = csdl.vdot(basis(i), R1)
-            fill_row(i, ri)
-        # R2 rows
-        for i in range(3):
-            ri = csdl.vdot(basis(i), R2)
-            fill_row(3 + i, ri)
-        # R3, R4 rows
-        fill_row(6, R3)
-        fill_row(7, R4)
+#         mu = float(lm_mu0)
+#         x = pack(a_seed_np, b_seed_np, np.array([0.0]), np.array([0.0]))
 
-        return F, J
+#         def FJ(x_vec):
+#             a_np, b_np, lamA_np, lamB_np = unpack(x_vec)
 
-    # Initial residual & norm
-    F, J = eval_F_and_J(a, b, lamA, lamB)
-    f2 = float(F @ F)
+#             a_v = csdl.Variable(value=a_np.reshape(3,))
+#             b_v = csdl.Variable(value=b_np.reshape(3,))
+#             lamA_v = csdl.Variable(value=lamA_np.reshape(1,))
+#             lamB_v = csdl.Variable(value=lamB_np.reshape(1,))
 
-    for it in range(max_iter):
-        # LM step: (J^T J + mu I) Δ = -J^T F
-        JTJ = J.T @ J
-        g   = J.T @ F
-        # Damping
-        JTJ_damped = JTJ + mu * np.eye(8, dtype=float)
+#             # SDFs and gradients
+#             phiA_a = phi_A(a_v); gA = csdl.reshape(csdl.derivative(ofs=phiA_a, wrts=a_v), (3,))
+#             phiB_b = phi_B(b_v); gB = csdl.reshape(csdl.derivative(ofs=phiB_b, wrts=b_v), (3,))
 
-        # Solve for Δ; if singular, bump mu and retry
-        try:
-            delta = -np.linalg.solve(JTJ_damped, g)
-        except np.linalg.LinAlgError:
-            mu *= mu_inc
-            continue
+#             diff = a_v - b_v
 
-        # Trial update
-        a_trial    = a    + delta[0:3]
-        b_trial    = b    + delta[3:6]
-        lamA_trial = lamA + delta[6:7]
-        lamB_trial = lamB + delta[7:8]
+#             # Residuals:
+#             # R1 = (a-b) + lamA * grad(phi_A)(a)    (3)
+#             # R2 = -(a-b) + lamB * grad(phi_B)(b)   (3)
+#             # R3 = w_phi * phi_A(a)                 (1)
+#             # R4 = w_phi * phi_B(b)                 (1)
+#             R1 = diff + csdl.reshape(lamA_v,(1,)) * gA
+#             R2 = -diff + csdl.reshape(lamB_v,(1,)) * gB
+#             R3 = w_phi * phiA_a
+#             R4 = w_phi * phiB_b
 
-        F_trial, J_trial = eval_F_and_J(a_trial, b_trial, lamA_trial, lamB_trial)
-        f2_trial = float(F_trial @ F_trial)
+#             F = np.zeros(8, float)
+#             F[0:3] = _to_np(R1,(3,))
+#             F[3:6] = _to_np(R2,(3,))
+#             F[6]   = float(R3.value)
+#             F[7]   = float(R4.value)
 
-        # Accept/reject
-        if f2_trial < f2:  # success
-            a, b, lamA, lamB = a_trial, b_trial, lamA_trial, lamB_trial
-            F, J, f2 = F_trial, J_trial, f2_trial
-            mu = max(mu * mu_dec, 1e-15)
-            # Convergence?
-            if f2 < tol:
-                break
-        else:
-            mu *= mu_inc  # reject step, increase damping and try again
+#             # Jacobian via AD row-by-row
+#             J = np.zeros((8,8), float)
 
-    # Outputs
-    a_v = csdl.Variable(value=a.reshape(3,))
-    b_v = csdl.Variable(value=b.reshape(3,))
-    diff = a_v - b_v
-    gap  = csdl.sqrt(csdl.vdot(diff, diff))
-    x_mid = 0.5 * (a_v + b_v)
+#             def fill_row(i, r_scalar):
+#                 da = csdl.derivative(ofs=r_scalar, wrts=a_v)  # (3,)
+#                 db = csdl.derivative(ofs=r_scalar, wrts=b_v)  # (3,)
+#                 dA = csdl.derivative(ofs=r_scalar, wrts=lamA_v) # (1,)
+#                 dB = csdl.derivative(ofs=r_scalar, wrts=lamB_v) # (1,)
+#                 J[i,0:3] = _to_np(da,(3,))
+#                 J[i,3:6] = _to_np(db,(3,))
+#                 J[i,6]   = float(dA.value)
+#                 J[i,7]   = float(dB.value)
 
-    if return_all:
-        lamA_v = csdl.Variable(value=lamA.reshape(1,))
-        lamB_v = csdl.Variable(value=lamB.reshape(1,))
-        return x_mid, a_v, b_v, lamA_v, lamB_v, gap
-    return gap
+#             # R1 rows
+#             fill_row(0, R1[0]); fill_row(1, R1[1]); fill_row(2, R1[2])
+#             # R2 rows
+#             fill_row(3, R2[0]); fill_row(4, R2[1]); fill_row(5, R2[2])
+#             # R3, R4 rows
+#             fill_row(6, R3); fill_row(7, R4)
+
+#             # Also return raw φ for taper decisions
+#             return F, J, float(phiA_a.value), float(phiB_b.value)
+
+#         F, J, phiA_val, phiB_val = FJ(x); f2 = float(F @ F)
+#         for _ in range(max_iter):
+#             JTJ = J.T @ J
+#             g = J.T @ F
+#             try:
+#                 dx = -np.linalg.solve(JTJ + mu*np.eye(8), g)
+#             except np.linalg.LinAlgError:
+#                 mu *= lm_mu_inc; continue
+
+#             x_trial = x + dx
+#             F_trial, J_trial, phiA_t, phiB_t = FJ(x_trial)
+#             f2_trial = float(F_trial @ F_trial)
+
+#             # Predicted reduction (Gauss–Newton model)
+#             pred_red = - (dx @ g) - 0.5 * (dx @ (JTJ @ dx))
+#             rho = (f2 - f2_trial) / max(pred_red, 1e-16)
+
+#             if rho > lm_eta and f2_trial < f2:
+#                 x, F, J, f2 = x_trial, F_trial, J_trial, f2_trial
+#                 phiA_val, phiB_val = phiA_t, phiB_t
+#                 mu = max(mu * lm_mu_dec, 1e-15)
+#                 if f2 < kkt_tol:
+#                     break
+#             else:
+#                 mu *= lm_mu_inc
+
+#         a_np, b_np, lamA_np, lamB_np = unpack(x)
+#         return a_np, b_np, lamA_np, lamB_np, f2, max(abs(phiA_val), abs(phiB_val))
+
+#     # ---------- Build Phase-1 seeds (two orders), run Phase-2 with schedule ----------
+#     x0_np = _to_np(x0, (3,))
+
+#     # Order A→B
+#     a_seed_A = _lm_project(phi_A, x0_np)
+#     b_seed_A = _lm_project(phi_B, a_seed_A)
+
+#     # Order B→A
+#     b_seed_B = _lm_project(phi_B, x0_np)
+#     a_seed_B = _lm_project(phi_A, b_seed_B)
+
+#     def run_schedule(a0_np, b0_np):
+#         a_np, b_np = a0_np.copy(), b0_np.copy()
+#         # Feasibility-weighted passes
+#         w = max(1.0, float(feas_weight_init))
+#         for s in range(max(1, feas_schedule_steps)):
+#             a_np, b_np, lamA_np, lamB_np, f2, feas = _kkt_LM(
+#                 a_np, b_np, w_phi=w, max_iter=kkt_max_iter, tol=kkt_tol
+#             )
+#             # Taper weight if feasible enough
+#             if feas <= feas_taper_threshold:
+#                 w = 1.0
+#                 break
+#             w = max(1.0, w * float(feas_weight_decay))
+#         # Final refinement at weight=1 (ensures unbiased stationarity)
+#         a_np, b_np, lamA_np, lamB_np, f2, feas = _kkt_LM(
+#             a_np, b_np, w_phi=1.0, max_iter=kkt_max_iter, tol=kkt_tol
+#         )
+#         return a_np, b_np, f2, feas
+
+#     aA_np, bA_np, f2A, feasA = run_schedule(a_seed_A, b_seed_A)
+#     aB_np, bB_np, f2B, feasB = run_schedule(a_seed_B, b_seed_B)
+
+#     # Pick the better candidate (prefer smaller gap; tie-break by feasibility & f2)
+#     def gap_of(a_np, b_np):
+#         diff = a_np - b_np
+#         return float(np.sqrt(np.dot(diff, diff)))
+
+#     gapA = gap_of(aA_np, bA_np)
+#     gapB = gap_of(aB_np, bB_np)
+
+#     if (gapA < gapB) or (abs(gapA-gapB) < 1e-12 and (feasA, f2A) <= (feasB, f2B)):
+#         a_best, b_best, gap_best = aA_np, bA_np, gapA
+#     else:
+#         a_best, b_best, gap_best = aB_np, bB_np, gapB
+
+#     # ---- Pack outputs as CSDL Variables (for downstream graph use) ----
+#     a_v = csdl.Variable(value=a_best.reshape(3,))
+#     b_v = csdl.Variable(value=b_best.reshape(3,))
+#     diff_v = a_v - b_v
+#     gap_v = csdl.sqrt(csdl.vdot(diff_v, diff_v) + 1e-16)
+#     x_mid = 0.5 * (a_v + b_v)
+
+#     if return_all:
+#         return x_mid, a_v, b_v, gap_v
+#     return gap_v
