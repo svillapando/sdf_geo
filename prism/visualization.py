@@ -139,8 +139,6 @@ def plot_isosurface_with_collision_points(
 
     plotter.show()
 
-
-
 def plot_3d_eikonal_violation(
     phi: np.ndarray,
     x: np.ndarray,
@@ -148,44 +146,19 @@ def plot_3d_eikonal_violation(
     z: np.ndarray,
     *,
     absolute: bool = True,          # plot |‖∇φ‖-1| (True) or signed (‖∇φ‖-1)
-    as_volume: bool = True,         # volume rendering (True) or isosurfaces (False)
-    iso_levels = (0.05, 0.10, 0.20),# isosurface levels for violation (in absolute units)
+    as_volume: bool = True,         # True => heatmap on φ=0 surface; False => isosurfaces of violation
+    iso_levels = (0.05, 0.10, 0.20),# isosurface levels for violation (when as_volume=False)
     title: str = "Eikonal violation map",
     cmap: str = "inferno",
-    opacity: float | None = None,   # None: auto ramp for volume
-    edge_order: int = 2,             # 2nd-order finite diff at edges
+    opacity: float | None = None,   # used only for isosurface branch; surface heatmap is opaque
+    edge_order: int = 2,            # 2nd-order finite diff at edges
     cool: bool = False              # Clear screen for screenshots
 ):
     """
     Plot a 3D map of the eikonal violation from a gridded SDF φ(x,y,z).
 
-    Parameters
-    ----------
-    phi : (nx, ny, nz) array
-        SDF samples on a rectilinear grid defined by x, y, z.
-    x, y, z : 1D arrays
-        Grid axes (monotone). Uniform spacing assumed for visualization.
-    absolute : bool
-        If True, visualize |‖∇φ‖ - 1|; otherwise visualize ‖∇φ‖ - 1 (signed).
-    as_volume : bool
-        If True, use volume rendering; else show isosurfaces of violation.
-    iso_levels : tuple[float,...]
-        Violation magnitudes to contour when as_volume=False.
-    title : str
-        Plot title.
-    cmap : str
-        Matplotlib colormap name for coloring.
-    opacity : float | None
-        Global mesh opacity for isosurfaces; None lets PyVista decide for volume.
-    edge_order : int
-        Order for np.gradient at edges (1 or 2).
-
-    Returns
-    -------
-    grad_norm : np.ndarray
-        The computed ‖∇φ‖ on the same grid.
-    violation : np.ndarray
-        Either |‖∇φ‖-1| (absolute=True) or (‖∇φ‖-1) (signed).
+    When as_volume=True: shows a HEATMAP OF VIOLATION ON THE φ=0 SURFACE.
+    When as_volume=False: shows discrete isosurfaces of violation in the volume.
     """
     # --- finite-difference gradient on the rectilinear grid ---
     dx = float(x[1] - x[0])
@@ -209,39 +182,51 @@ def plot_3d_eikonal_violation(
     grid.spacing = (dx, dy, dz)
     grid.origin = (x[0], y[0], z[0])
 
-    # Important: keep Fortran order to match pv.ImageData memory expectations
+    # Attach both φ and violation so we can contour by φ and color by violation
+    grid.point_data["phi"] = phi.flatten(order="F")
     grid.point_data[scalars_name] = violation.flatten(order="F")
+    grid.point_data["grad_norm"] = grad_norm.flatten(order="F")  # optional debug
 
-    # Optional: also attach grad_norm if you want to inspect later
-    grid.point_data["grad_norm"] = grad_norm.flatten(order="F")
-
-    if cool == True:
-        scale = False
-    else:
-        scale = True
+    scale = not cool
 
     # --- visualize ---
     plotter = pv.Plotter()
+
     if as_volume:
-        # Volume render the violation; smaller values -> more transparent
-        # Build a simple opacity transfer if none provided
-        if opacity is None:
-            # Build a simple opacity ramp: transparent at 0, opaque by ~max violation
-            vmax = np.percentile(violation, 99.5)
-            vmax = vmax if vmax > 0 else 1.0
-            opacity = [0.0, 0.2, 0.6, 1.0]   # piecewise values
-        plotter.add_volume(grid, scalars=scalars_name, cmap=cmap, opacity=opacity)
+        # === HEATMAP ON THE φ=0 SURFACE ===
+        surface = grid.contour(isosurfaces=[0.0], scalars="phi")  # extract zero level set
+        # Plot the surface colored by violation interpolated onto the surface
+        # (PyVista interpolates attached point_data during contouring)
+        # Choose a robust color range
+        vmin = np.percentile(violation, 1.0)
+        vmax = np.percentile(violation, 99.0)
+        if vmin == vmax:
+            vmin, vmax = 0.0, float(np.max(violation) or 1.0)
+
+        plotter.add_mesh(
+            surface,
+            scalars=scalars_name,
+            cmap=cmap,
+            clim=(vmin, vmax),
+            show_scalar_bar=scale,
+            smooth_shading=True,
+            opacity=1.0,  # heatmap on surface is typically opaque
+        )
     else:
-        # Contour specific violation magnitudes (isosurfaces)
-        # Use positive magnitudes even when signed=False
+        # === DISCRETE ISOSURFACES OF VIOLATION IN THE VOLUME ===
         levels = np.asarray(iso_levels, float)
         levels = np.unique(np.abs(levels))
         if levels.size == 0:
             levels = np.array([0.1], float)
         contour = grid.contour(isosurfaces=list(levels), scalars=scalars_name)
-        plotter.add_mesh(contour, cmap=cmap, opacity=opacity if opacity is not None else 0.6, show_scalar_bar = scale)
+        plotter.add_mesh(
+            contour,
+            cmap=cmap,
+            opacity=opacity if opacity is not None else 0.6,
+            show_scalar_bar=scale
+        )
 
-    if cool == False:
+    if not cool:
         plotter.add_axes()
         plotter.add_title(title)
         plotter.show()
