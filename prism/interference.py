@@ -1,183 +1,546 @@
 
-from __future__ import annotations
-from typing import Callable, Union, Tuple
+from typing import Callable, Dict, Tuple
 import numpy as np
 import csdl_alpha as csdl
+from prism import operations as op
 
-
-SDF = Callable[[csdl.Variable], csdl.Variable]
-
-_DEF_EPS = 1e-12
-
-# Collision check similar to paper
 def collision_check(
-    phi_A: SDF,
-    phi_B: SDF,
-    x0: Union[np.ndarray, csdl.Variable],
+    phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
+    phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
+    pos_w_m: csdl.Variable,
+    quat_wxyz: csdl.Variable,
     *,
-    rho: float = 20.0,             # higher = sharper max; start 5–20
-    return_all: bool = False,
-    newton_name: str = "collision_check_smooth",
-) -> Tuple[csdl.Variable, ...] | csdl.Variable:
+    max_refine: int = 8,
+    enable_phase2: bool = True,
+    K: int = 5,
+    plot: bool = False,
+) -> Tuple[Dict[int, np.ndarray], Dict[int, Tuple[float, float, float]], csdl.Variable, csdl.Variable, np.ndarray]:
     """
-    Differentiable SDF-SDF proximity/collision check
+    Octree broad-phase + (small) differentiable narrow-phase aggregator for two SDFs.
 
-    Steps:
-      1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
-      2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
-      3) Project once from x_K to each surface:
-           a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
-           b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
-      4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
-         and optionally x_K, a, b.
+    Assumptions
+    ----------
+    • phi_A_body_cm : evaluates points given in DRONE BODY frame **centimeters** (returns cm)
+    • phi_B_world_m : evaluates points given in WORLD frame **meters** (returns m)
+    • The drone pose (pos, quat) maps WORLD→BODY; we convert WORLD meters to BODY cm for φ_A.
 
-    Returns:
-      If return_all: (x_K, F_star, a, b, gap), else just F.
+    Parameters
+    ----------
+    phi_A_body_cm : Callable[[csdl.Variable], csdl.Variable]
+        CSDL SDF for object A (drone) in body/cm.
+    phi_B_world_m : Callable[[csdl.Variable], csdl.Variable]
+        CSDL SDF for object/obstacle B in world/m.
+    pos_w_m : csdl.Variable (shape (3,))
+        Drone position in world coordinates (meters).
+    quat_wxyz : csdl.Variable (shape (4,))
+        World-from-body quaternion in (w,x,y,z) order.
+    max_refine : int, default 8
+        Octree depth (number of refinement iterations).
+    enable_phase2 : bool, default True
+        If True, apply extra culling using φ_B at voxel centers.
+    K : int, default 5
+        Number of top candidate voxels to feed the differentiable aggregator.
+    plot : bool, default False
+        If True, produce PyVista/Matplotlib visualizations.
+
+    Returns
+    -------
+    kept3d : dict[int, (N_L,3) np.ndarray]
+        Per refinement level L ∈ {0..max_refine}, voxel centers kept (WORLD, m).
+    halfsizes : dict[int, (hx,hy,hz)]
+        Per level voxel half-sizes (WORLD, m).
+    d_soft : csdl.Variable (scalar)
+        Differentiable conservative distance-like metric (soft-min over K candidates).
+    stack : csdl.Variable (K, 1)
+        The per-candidate conservative intersection values before soft-min.
+    C_top : (K,3) np.ndarray
+        WORLD (m) coordinates of the K candidates used in the differentiable stage.
     """
-    # ---- seed x0 as leaf variable ----
-    if isinstance(x0, csdl.Variable):
-        x0_np = np.asarray(x0.value, float).reshape(3,)
-    else:
-        x0_np = np.asarray(x0, float).reshape(3,)
-    x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
 
-    # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
+    # -----------------------
+    # Helpers (NumPy path)
+    # -----------------------
+    def _as_array(x, shape):
+        return np.asarray(getattr(x, 'value', x), float).reshape(shape)
 
-    #for c_i in (0.9, 0.5, 0.25): 
-    #c_i = 1.0
+    def _quat_to_R_wb(q):
+        """Rotation matrix (WORLD ← BODY) from quaternion (w,x,y,z)."""
+        w, x, y, z = q
+        n = np.linalg.norm(q)
+        if n == 0:
+            return np.eye(3)
+        w, x, y, z = q / n
+        return np.array([
+            [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
+        ])
 
-      # inside each pull iteration
-    FA = phi_A(x)
-    FB = phi_B(x)
-    F  = csdl.maximum(FA, FB, rho=rho)
+    p_w  = _as_array(pos_w_m, (3,))
+    R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
 
-    gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
-    gF_norm = csdl.sqrt(csdl.vdot(gF, gF)) + _DEF_EPS
+    def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+        P_b_m  = (P_w_m - p_w) @ R_wb.T        # world→body (meters)
+        P_b_cm = 100.0 * P_b_m                 # meters→centimeters
+        vals_cm = phi_A_body_cm(P_b_cm).value  # cm
+        return 0.01 * np.asarray(vals_cm).reshape(-1)  # meters
 
-    # adaptive step length: eta = min(c * |F|, eta_max)
-    #eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+    def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+        vals = phi_B_world_m(P_w_m).value
+        return np.asarray(vals).reshape(-1)
 
-    x = x - (gF / gF_norm)
+    # -----------------------
+    # Voxel structure
+    # -----------------------
+    class Voxels:
+        def __init__(self, nodes: np.ndarray, L: int, bounds: Tuple[float, float, float, float, float, float]):
+            self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+            self.L = int(L)
+            self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
 
-    xK = x
-    F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) -1.0
+        @classmethod
+        def root(cls, bounds):
+            return cls(nodes=np.array([[0,0,0]], dtype=np.int64), L=0, bounds=bounds)
+
+        def _sizes(self):
+            W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
+            n = 1 << self.L
+            dx, dy, dz = W/n, H/n, D/n
+            hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
+            return dx, dy, dz, hx, hy, hz
+
+        def centers(self) -> np.ndarray:
+            dx, dy, dz, _, _, _ = self._sizes()
+            i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
+            cx = self.xmin + (i + 0.5) * dx
+            cy = self.ymin + (j + 0.5) * dy
+            cz = self.zmin + (k + 0.5) * dz
+            return np.column_stack([cx, cy, cz])
+
+        def half_sizes(self) -> Tuple[float, float, float]:
+            _, _, _, hx, hy, hz = self._sizes()
+            return float(hx), float(hy), float(hz)
+
+        def radius(self) -> float:
+            hx, hy, hz = self.half_sizes()
+            return float(np.sqrt(hx*hx + hy*hy + hz*hz))
+
+        def subdivide(self):
+            i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
+            kids = np.array([
+                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
+            ]).reshape(-1, 3)
+            return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
+
+        def restrict(self, mask: np.ndarray):
+            self.nodes = self.nodes[np.asarray(mask, bool)]
+
+    # -----------------------
+    # Auto-size root bounds by probing φ_A in world space
+    # -----------------------
+    def _autosize_root_bbox() -> Tuple[float, float, float, float, float, float]:
+        dirs = []
+        s = 1/np.sqrt(2); t = 1/np.sqrt(3)
+        axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
+        edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],
+                 [+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
+                 [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
+        corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],
+                   [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
+        for d in axes + edges + corners:
+            v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
+        radii = np.linspace(0.05, 0.80, 32)  # meters
+        max_hit = 0.25; margin = 0.05
+        for d in dirs:
+            phis = [phi_A_numeric_world([p_w + r*d])[0] for r in radii]
+            phis = np.asarray(phis)
+            if (phis > 0.01).any():
+                idx = np.argmax(phis > 0.01)
+                hit_r = radii[min(idx+1, len(radii)-1)]
+            else:
+                hit_r = radii[-1]
+            max_hit = max(max_hit, float(hit_r))
+        half = max_hit + margin
+        return (p_w[0]-half, p_w[0]+half, p_w[1]-half, p_w[1]+half, p_w[2]-half, p_w[2]+half)
+
+    root_bounds = _autosize_root_bbox()
+
+    # -----------------------
+    # One refinement step
+    # -----------------------
+    def _refine_once(vox: "Voxels"):
+        vox = vox.subdivide()
+        r   = vox.radius()
+        C   = vox.centers()
+        keep1 = (phi_A_numeric_world(C) <= r)     # Phase-1 on φ_A
+        vox.restrict(keep1)
+
+        interval = (np.nan, np.nan)
+        if enable_phase2 and len(vox.nodes) > 0:
+            C2 = vox.centers()
+            phiB = phi_B_numeric_world(C2)
+            min_u = np.min(phiB) + r
+            keep2 = (phiB <= (min_u + r))         # Phase-2 on φ_B
+            vox.restrict(keep2)
+            interval = (min_u - 2.0*r, min_u)
+        return vox, interval
+
+    # -----------------------
+    # Run refinement
+    # -----------------------
+    vox = Voxels.root(root_bounds)
+    kept3d     = {0: vox.centers().copy()}
+    intervals  = {0: (np.nan, np.nan)}
+    halfsizes  = {0: vox.half_sizes()}
+
+    for L in range(max_refine):
+        vox, inter = _refine_once(vox)
+        kept3d[L+1]    = vox.centers().copy()
+        intervals[L+1] = inter
+        halfsizes[L+1] = vox.half_sizes()
+
+    # -----------------------
+    # Differentiable narrow-phase over top-K candidates
+    # -----------------------
+    C_final = kept3d[max_refine]
+
+    hx, hy, hz = halfsizes[max_refine]
+    r_cell = float(np.linalg.norm([hx, hy, hz]))  # half-diagonal of voxels at final level
+
+    # Rank candidates by conservative score φ_B(center) - r_cell
+    phiB_centers = phi_B_numeric_world(C_final)
+    scores = phiB_centers - r_cell
+    order  = np.argsort(scores)
+    k = int(min(K, len(order)))
+    C_top = C_final[order[:k]]
+
+    # ---- CSDL helpers for pose + φ_A in world ----
+    def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
+        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+        r00 = 1.0 - 2.0*(qy*qy + qz*qz)
+        r01 = 2.0*(qx*qy - qw*qz)
+        r02 = 2.0*(qx*qz + qw*qy)
+        r10 = 2.0*(qx*qy + qw*qz)
+        r11 = 1.0 - 2.0*(qx*qx + qz*qz)
+        r12 = 2.0*(qy*qz - qw*qx)
+        r20 = 2.0*(qx*qz - qw*qy)
+        r21 = 2.0*(qy*qz + qw*qx)
+        r22 = 1.0 - 2.0*(qx*qx + qy*qy)
+        R_flat = csdl.vstack((r00, r01, r02,
+                              r10, r11, r12,
+                              r20, r21, r22))
+        return csdl.reshape(R_flat, (3, 3))
+
+    def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
+        R_wb_cs = quat_to_rm_csdl(quat_wxyz)
+        R_bw_cs = csdl.transpose(R_wb_cs)
+        rel  = p_w - pos_w_m                       # world m
+        x_b_cm = 100.0 * csdl.matvec(R_bw_cs, rel) # body cm
+        return phi_A_body_cm(x_b_cm) / 100.0       # meters
+
+    # Conservative per-candidate metric: intersection(φ_A, φ_B)(c) − r_cell
+
+    F = op.intersection(phi_A_world_m, phi_B_world_m)  # world→m
+    m_list = []
+    for j in range(k):
+        c_j = C_top[j]
+        m_j = F(c_j) - r_cell
+        m_list.append(m_j)
+    stack = csdl.vstack(tuple(m_list))  # (k,1)
+
+    # Soft-min across candidates (your csdl.minimum implements a smooth min)
+    d_soft = csdl.minimum(stack)  # scalar
+
+    # -----------------------
+    # Optional visualization (PyVista + Matplotlib)
+    # -----------------------
+    if plot:
+        try:
+            import pyvista as pv
+            # Build a local grid around the remaining cells for context
+            C = kept3d[max_refine]
+            if len(C) == 0:
+                mins = np.array([[root_bounds[0], root_bounds[2], root_bounds[4]]])
+                maxs = np.array([[root_bounds[1], root_bounds[3], root_bounds[5]]])
+            else:
+                H = np.tile(np.array([hx, hy, hz], float), (len(C), 1))
+                mins = C - H; maxs = C + H
+            xmin, ymin, zmin = mins.min(axis=0)
+            xmax, ymax, zmax = maxs.max(axis=0)
+            pad = 0.35
+            xmin -= pad; ymin -= pad; zmin -= pad
+            xmax += pad; ymax += pad; zmax += pad
+
+            Nx = Ny = Nz = 96
+            x = np.linspace(xmin, xmax, Nx)
+            y = np.linspace(ymin, ymax, Ny)
+            z = np.linspace(zmin, zmax, Nz)
+            X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+            P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+            phiA = phi_A_numeric_world(P).reshape(X.shape)
+            phiB = phi_B_numeric_world(P).reshape(X.shape)
+
+            plotter = pv.Plotter()
+            # φ_A isosurface
+            if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
+                gridA = pv.ImageData()
+                gridA.dimensions = np.array(phiA.shape)
+                gridA.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+                gridA.origin    = (x[0], y[0], z[0])
+                gridA.point_data["phiA"] = phiA.flatten(order="F")
+                contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
+                plotter.add_mesh(contA, color="royalblue", opacity=0.55)
+
+            # φ_B isosurface
+            if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
+                gridB = pv.ImageData()
+                gridB.dimensions = np.array(phiB.shape)
+                gridB.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+                gridB.origin    = (x[0], y[0], z[0])
+                gridB.point_data["phiB"] = phiB.flatten(order="F")
+                contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
+                plotter.add_mesh(contB, color="tomato", opacity=0.55)
+
+            # Remaining voxel wireframes (downsampled)
+            Cdraw = kept3d[max_refine]
+            MAX_DRAW = 1500
+            step = max(1, len(Cdraw)//MAX_DRAW if len(Cdraw) else 1)
+            for i in range(0, len(Cdraw), step):
+                cx, cy, cz = Cdraw[i]
+                cube = pv.Cube(center=(cx, cy, cz),
+                               x_length=2*hx, y_length=2*hy, z_length=2*hz)
+                plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
+
+            plotter.show_bounds(grid='front', location='outer', color='black',
+                                xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
+            plotter.add_axes(); plotter.add_title("Pose / Remaining Cells")
+            plotter.show()
+        except Exception as e:
+            print("[viz] skipped:", e)
+
+        # Matplotlib diagnostic plots (counts + φ_B bracket intervals)
+        try:
+            import matplotlib.pyplot as plt
+            order = sorted(kept3d.keys())
+            counts = [len(kept3d[k]) for k in order]
+            lows   = [intervals[k][0] for k in order]
+            upps   = [intervals[k][1] for k in order]
+            mids   = [0.5*(l+u) for l, u in zip(lows, upps)]
+
+            figC, axC = plt.subplots(figsize=(6,4))
+            axC.plot(order, counts, marker='o')
+            axC.set_xticks(order); axC.set_xlabel("Refine level L")
+            axC.set_ylabel("Voxels kept")
+            axC.set_title(f"3D remaining voxels ({'Phase-1+2' if enable_phase2 else 'Phase-1 only'})")
+            axC.grid(True, alpha=0.3)
+
+            figI, axI = plt.subplots(figsize=(7,4))
+            axI.plot(order, lows, marker='v', label='Lower bound')
+            axI.plot(order, upps, marker='^', label='Upper bound')
+            axI.plot(order, mids, marker='o', linestyle='--', label='Midpoint')
+            axI.set_xticks(order)
+            axI.set_xlabel("Refine level L"); axI.set_ylabel("Bracket on min φ_B (restricted)")
+            axI.set_title("3D interval bounds over refinement levels")
+            axI.grid(True, alpha=0.3); axI.legend()
+            plt.show()
+        except Exception as e:
+            print("[plot] skipped:", e)
+
+    return d_soft
+
+
+
+
+
+
+
+
+
+
+
+# #SDF = Callable[[csdl.Variable], csdl.Variable]
+
+# #_DEF_EPS = 1e-12
+
+# # Collision check similar to paper
+# def collision_check(
+#     phi_A: SDF,
+#     phi_B: SDF,
+#     x0: Union[np.ndarray, csdl.Variable],
+#     *,
+#     rho: float = 20.0,             # higher = sharper max; start 5–20
+#     return_all: bool = False,
+#     newton_name: str = "collision_check_smooth",
+# ) -> Tuple[csdl.Variable, ...] | csdl.Variable:
+#     """
+#     Differentiable SDF-SDF proximity/collision check
+
+#     Steps:
+#       1) Define smooth joint field F(x) = max(phi_A(x), phi_B(x)) 
+#       2) Do K fixed 'pull' steps: x <- x - eta * ∇F / ||∇F||.
+#       3) Project once from x_K to each surface:
+#            a = x_K - phi_A(x_K) / ||∇phi_A(x_K)||^2 * ∇phi_A(x_K)
+#            b = x_K - phi_B(x_K) / ||∇phi_B(x_K)||^2 * ∇phi_B(x_K)
+#       4) Outputs: gap = ||a - b||  (always >= 0), F_star = F(x_K),
+#          and optionally x_K, a, b.
+
+#     Returns:
+#       If return_all: (x_K, F_star, a, b, gap), else just F.
+#     """
+#     # ---- seed x0 as leaf variable ----
+#     if isinstance(x0, csdl.Variable):
+#         x0_np = np.asarray(x0.value, float).reshape(3,)
+#     else:
+#         x0_np = np.asarray(x0, float).reshape(3,)
+#     #x = csdl.Variable(name=f"{newton_name}:x0", shape=(3,), value=x0_np)
+#     x = x0
+#     # ---- finite gradient steps on F(x) = max(phi_A, phi_B) ----
+
+#     #for c_i in (0.9, 0.5, 0.25): 
+#     #c_i = 1.0
+
+#       # inside each pull iteration
+#     FA = phi_A(x)
+#     FB = phi_B(x)
+#     F  = csdl.maximum(FA, FB, rho=rho)
+
+#     gF = csdl.reshape(csdl.derivative(ofs=F, wrts=x), (3,))
+#     gF_norm = csdl.norm(gF) + _DEF_EPS
+
+#     # adaptive step length: eta = min(c * |F|, eta_max)
+#     #eta = csdl.minimum(c_i * csdl.absolute(F), eta_max)   # choose c_i per pull, e.g. 0.7, 0.35, 0.2
+
+#     x = x - (gF / gF_norm)
+
+#     xK = x
+#     F_star = csdl.maximum(phi_A(xK), phi_B(xK), rho=rho) -1.0
 
     
-    #---- two-step projection to each surface from xK ----
-    if return_all:
-        # ---------- helpers: safe L2 norm and unit ----------
-        def safe_norm2(v, eps=_DEF_EPS):
-            ax = csdl.absolute(v)
-            vmax01 = csdl.maximum(ax[0], ax[1])
-            vmax   = csdl.maximum(vmax01, ax[2])            # max(|v_i|)
-            scale  = csdl.maximum(vmax, csdl.Variable(value = 1.0))                # keep >= 1 to avoid div-by-zero
-            v_sc   = v / scale
-            return scale * csdl.sqrt(csdl.vdot(v_sc, v_sc) + eps)
+#     #---- two-step projection to each surface from xK ----
+#     if return_all:
+#         # ---------- helpers: safe L2 norm and unit ----------
+#         def safe_norm2(v, eps=_DEF_EPS):
+#             ax = csdl.absolute(v)
+#             vmax01 = csdl.maximum(ax[0], ax[1])
+#             vmax   = csdl.maximum(vmax01, ax[2])            # max(|v_i|)
+#             scale  = csdl.maximum(vmax, csdl.Variable(value = 1.0))                # keep >= 1 to avoid div-by-zero
+#             v_sc   = v / scale
+#             return scale * csdl.sqrt(csdl.vdot(v_sc, v_sc) + eps)
 
-        def safe_unit(v, eps=_DEF_EPS):
-            return v / (safe_norm2(v, eps) + eps)
+#         def safe_unit(v, eps=_DEF_EPS):
+#             return v / (safe_norm2(v, eps) + eps)
 
-        # ---- keep a copy of the candidate x* for residuals ----
-        x_cand = xK
-        np.set_printoptions(precision=6, suppress=True)
+#         # ---- keep a copy of the candidate x* for residuals ----
+#         x_cand = xK
+#         np.set_printoptions(precision=6, suppress=True)
 
-        def _inf_norm(u):      # for numpy arrays (after .value)
-            return float(np.max(np.abs(u)))
-
-
-        x_cand = xK
-
-        # ===== A: first projection step =====
-        print("[PIN] before phi_A(x)")
-        FA0 = phi_A(x_cand)
-        print("[PIN] after  phi_A(x) | FA(x)=", float(FA0.value))
-
-        print("[PIN] before gradA(x)")
-        gA0 = csdl.reshape(csdl.derivative(ofs=FA0, wrts=x_cand), (3,))
-        print("[PIN] after  gradA(x) | max|gA|=", float(np.max(np.abs(gA0.value))))
-
-        gA0n = safe_norm2(gA0) + _DEF_EPS
-        sA   = csdl.absolute(FA0) / gA0n
-        a1   = x_cand - (FA0 * gA0) / (gA0n * gA0n)
-
-        print("[DBG] A0  | FA(x)       =", float(FA0.value),
-                "||gA||    =", float(gA0n.value),
-                "max|gA|   =", float(np.max(np.abs(gA0.value))),
-                "step      =", float(sA.value),
-                "||x||inf  =", _inf_norm(x_cand.value),
-                "||a1||inf =", _inf_norm(a1.value))
-
-        # This call is a common overflow point if a1 jumped far:
-        FA1 = phi_A(a1)
-        print("[DBG] A1  | FA(a1)      =", float(FA1.value))
-
-        # ===== A: second projection step =====
-        gA1  = csdl.reshape(csdl.derivative(ofs=FA1, wrts=a1), (3,))
-        gA1n = safe_norm2(gA1) + _DEF_EPS
-        a    = a1 - (FA1 * gA1) / (gA1n * gA1n)
-
-        print("[DBG] A2  | ||gA(a1)||  =", float(gA1n.value),
-                "max|gA(a1)|=", float(np.max(np.abs(gA1.value))),
-                "||a||inf   =", _inf_norm(a.value))
-
-        # ===== B: first projection step =====
-        FB0  = phi_B(x_cand)
-        gB0  = csdl.reshape(csdl.derivative(ofs=FB0, wrts=x_cand), (3,))
-        gB0n = safe_norm2(gB0) + _DEF_EPS
-        sB   = csdl.absolute(FB0) / gB0n
-        b1   = x_cand - (FB0 * gB0) / (gB0n * gB0n)
-
-        print("[DBG] B0  | FB(x)       =", float(FB0.value),
-                "||gB||    =", float(gB0n.value),
-                "max|gB|   =", float(np.max(np.abs(gB0.value))),
-                "step      =", float(sB.value),
-                "||x||inf  =", _inf_norm(x_cand.value),
-                "||b1||inf =", _inf_norm(b1.value))
-
-        # Another common overflow point:
-        FB1 = phi_B(b1)
-        print("[DBG] B1  | FB(b1)      =", float(FB1.value))
-
-        # ===== B: second projection step =====
-        gB1  = csdl.reshape(csdl.derivative(ofs=FB1, wrts=b1), (3,))
-        gB1n = safe_norm2(gB1) + _DEF_EPS
-        b    = b1 - (FB1 * gB1) / (gB1n * gB1n)
-
-        print("[DBG] B2  | ||gB(b1)||  =", float(gB1n.value),
-                "max|gB(b1)|=", float(np.max(np.abs(gB1.value))),
-                "||b||inf   =", _inf_norm(b.value))
-
-        # ---- gap (optional) ----
-        diff = a - b
-        gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
-        print("[DBG] GAP | ||a-b||     =", float(gap.value))
-
-        # ===== residuals =====
-        FA_x = phi_A(x_cand); FB_x = phi_B(x_cand)
-        r_eq = csdl.absolute(FA_x - FB_x)
-        print("[DBG] EQ  | |FA-FB|     =", float(r_eq.value))
-
-        FA_a = phi_A(a); gA_a = csdl.reshape(csdl.derivative(ofs=FA_a, wrts=a), (3,))
-        FB_b = phi_B(b); gB_b = csdl.reshape(csdl.derivative(ofs=FB_b, wrts=b), (3,))
-        nA   = gA_a / (safe_norm2(gA_a) + _DEF_EPS)
-        nB   = gB_b / (safe_norm2(gB_b) + _DEF_EPS)
-
-        print("[DBG] NRM | ||gA(a)||   =", float(safe_norm2(gA_a).value),
-                "||gB(b)|| =", float(safe_norm2(gB_b).value),
-                "max|gA(a)|=", float(np.max(np.abs(gA_a.value))),
-                "max|gB(b)|=", float(np.max(np.abs(gB_b.value))))
-
-        r_dir = 0.5 * safe_norm2(nA + nB)
-        print("[DBG] DIR | r_dir       =", float(r_dir.value))
-
-        r_eik_A = csdl.absolute(safe_norm2(gA_a) - 1.0)
-        r_eik_B = csdl.absolute(safe_norm2(gB_b) - 1.0)
-        print("[DBG] EIK | A=", float(r_eik_A.value), "B=", float(r_eik_B.value))
+#         def _inf_norm(u):      # for numpy arrays (after .value)
+#             return float(np.max(np.abs(u)))
 
 
-    if return_all:
-        return xK, F_star, a, b
-    return xK, F_star
+#         x_cand = xK
+
+#         # ===== A: first projection step =====
+#         print("[PIN] before phi_A(x)")
+#         FA0 = phi_A(x_cand)
+#         print("[PIN] after  phi_A(x) | FA(x)=", float(FA0.value))
+
+#         print("[PIN] before gradA(x)")
+#         gA0 = csdl.reshape(csdl.derivative(ofs=FA0, wrts=x_cand), (3,))
+#         print("[PIN] after  gradA(x) | max|gA|=", float(np.max(np.abs(gA0.value))))
+
+#         gA0n = safe_norm2(gA0) + _DEF_EPS
+#         sA   = csdl.absolute(FA0) / gA0n
+#         a1   = x_cand - (FA0 * gA0) / (gA0n * gA0n)
+
+#         print("[DBG] A0  | FA(x)       =", float(FA0.value),
+#                 "||gA||    =", float(gA0n.value),
+#                 "max|gA|   =", float(np.max(np.abs(gA0.value))),
+#                 "step      =", float(sA.value),
+#                 "||x||inf  =", _inf_norm(x_cand.value),
+#                 "||a1||inf =", _inf_norm(a1.value))
+
+#         # This call is a common overflow point if a1 jumped far:
+#         FA1 = phi_A(a1)
+#         print("[DBG] A1  | FA(a1)      =", float(FA1.value))
+
+#         # ===== A: second projection step =====
+#         gA1  = csdl.reshape(csdl.derivative(ofs=FA1, wrts=a1), (3,))
+#         gA1n = safe_norm2(gA1) + _DEF_EPS
+#         a    = a1 - (FA1 * gA1) / (gA1n * gA1n)
+
+#         print("[DBG] A2  | ||gA(a1)||  =", float(gA1n.value),
+#                 "max|gA(a1)|=", float(np.max(np.abs(gA1.value))),
+#                 "||a||inf   =", _inf_norm(a.value))
+
+#         # ===== B: first projection step =====
+#         FB0  = phi_B(x_cand)
+#         gB0  = csdl.reshape(csdl.derivative(ofs=FB0, wrts=x_cand), (3,))
+#         gB0n = safe_norm2(gB0) + _DEF_EPS
+#         sB   = csdl.absolute(FB0) / gB0n
+#         b1   = x_cand - (FB0 * gB0) / (gB0n * gB0n)
+
+#         print("[DBG] B0  | FB(x)       =", float(FB0.value),
+#                 "||gB||    =", float(gB0n.value),
+#                 "max|gB|   =", float(np.max(np.abs(gB0.value))),
+#                 "step      =", float(sB.value),
+#                 "||x||inf  =", _inf_norm(x_cand.value),
+#                 "||b1||inf =", _inf_norm(b1.value))
+
+#         # Another common overflow point:
+#         FB1 = phi_B(b1)
+#         print("[DBG] B1  | FB(b1)      =", float(FB1.value))
+
+#         # ===== B: second projection step =====
+#         gB1  = csdl.reshape(csdl.derivative(ofs=FB1, wrts=b1), (3,))
+#         gB1n = safe_norm2(gB1) + _DEF_EPS
+#         b    = b1 - (FB1 * gB1) / (gB1n * gB1n)
+
+#         print("[DBG] B2  | ||gB(b1)||  =", float(gB1n.value),
+#                 "max|gB(b1)|=", float(np.max(np.abs(gB1.value))),
+#                 "||b||inf   =", _inf_norm(b.value))
+
+#         # ---- gap (optional) ----
+#         diff = a - b
+#         gap  = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
+#         print("[DBG] GAP | ||a-b||     =", float(gap.value))
+
+#         # ===== residuals =====
+#         FA_x = phi_A(x_cand); FB_x = phi_B(x_cand)
+#         r_eq = csdl.absolute(FA_x - FB_x)
+#         print("[DBG] EQ  | |FA-FB|     =", float(r_eq.value))
+
+#         FA_a = phi_A(a); gA_a = csdl.reshape(csdl.derivative(ofs=FA_a, wrts=a), (3,))
+#         FB_b = phi_B(b); gB_b = csdl.reshape(csdl.derivative(ofs=FB_b, wrts=b), (3,))
+#         nA   = gA_a / (safe_norm2(gA_a) + _DEF_EPS)
+#         nB   = gB_b / (safe_norm2(gB_b) + _DEF_EPS)
+
+#         print("[DBG] NRM | ||gA(a)||   =", float(safe_norm2(gA_a).value),
+#                 "||gB(b)|| =", float(safe_norm2(gB_b).value),
+#                 "max|gA(a)|=", float(np.max(np.abs(gA_a.value))),
+#                 "max|gB(b)|=", float(np.max(np.abs(gB_b.value))))
+
+#         r_dir = 0.5 * safe_norm2(nA + nB)
+#         print("[DBG] DIR | r_dir       =", float(r_dir.value))
+
+#         r_eik_A = csdl.absolute(safe_norm2(gA_a) - 1.0)
+#         r_eik_B = csdl.absolute(safe_norm2(gB_b) - 1.0)
+#         print("[DBG] EIK | A=", float(r_eik_A.value), "B=", float(r_eik_B.value))
+
+
+#     if return_all:
+#         return xK, F_star, a, b
+#     return xK, F_star
 
 
 

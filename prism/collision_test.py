@@ -117,9 +117,9 @@ c_rot_ref = rotor_centers[0]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 12.0),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 1.0),
                           c_rot_ref[1]- (rotor_radius - 5),
-                          c_rot_ref[2]+ 10.0])
+                          c_rot_ref[2]+ 1.0])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
     c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball),
@@ -143,7 +143,7 @@ x0 = csdl.Variable(value=x0_mid_np)
 eta_max = csdl.Variable(value = 0.3)
 
 # Run
-result = collision_check(phi_drone, phi_ball, x0, eta_max, return_all=True)
+result = collision_check(phi_drone, phi_ball, x0, return_all=True)
 #result = collision_check_kkt_LM(phi_drone, phi_ball, x0, return_all=True)
 x_star   = result[0].value
 F_star   = result[1].value
