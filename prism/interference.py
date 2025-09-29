@@ -260,16 +260,17 @@ def collision_check(
 
     # Conservative per-candidate metric: intersection(φ_A, φ_B)(c) − r_cell
 
-    F = op.intersection(phi_A_world_m, phi_B_world_m)  # world→m
     m_list = []
     for j in range(k):
-        c_j = C_top[j]
-        m_j = F(c_j) - r_cell
-        m_list.append(m_j)
-    stack = csdl.vstack(tuple(m_list))  # (k,1)
+        c = C_top[j]                         # (3,)
+        a = phi_A_world_m(c)                 # scalar
+        b = phi_B_world_m(c)                 # scalar
+        diff = a - b                         # scalar
+        m_j = csdl.sqrt(diff*diff) - r_cell
+        m_list.append(csdl.reshape(m_j, (1,1)))  # (1,1)
 
-    # Soft-min across candidates (your csdl.minimum implements a smooth min)
-    d_soft = csdl.minimum(stack)  # scalar
+    stack = csdl.vstack(tuple(m_list))           # (k,1)
+    d_soft = csdl.minimum(csdl.reshape(stack, (k,)))  # scalar
 
     # -----------------------
     # Optional visualization (PyVista + Matplotlib)
