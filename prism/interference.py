@@ -9,6 +9,7 @@ def collision_check(
     phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
     pos_w_m: csdl.Variable,
     quat_wxyz: csdl.Variable,
+    recorder: csdl.Recorder = None,
     *,
     max_refine: int = 8,
     enable_phase2: bool = True,
@@ -90,6 +91,11 @@ def collision_check(
         P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
         vals = phi_B_world_m(P_w_m).value
         return np.asarray(vals).reshape(-1)
+
+    # Freeze current recorder for broad-phase, use dummy recorder for now
+    recorder.stop()
+    dummy = csdl.Recorder(inline=True)
+    dummy.start()
 
     # -----------------------
     # Voxel structure
@@ -223,6 +229,11 @@ def collision_check(
     k = int(min(K, len(order)))
     C_top = C_final[order[:k]]
 
+
+    # Switch back to main recorder for differentiable ops
+    dummy.stop()
+    recorder.start()
+    
     # ---- CSDL helpers for pose + φ_A in world ----
     def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
         qw, qx, qy, qz = q[0], q[1], q[2], q[3]
