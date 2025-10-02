@@ -117,9 +117,9 @@ c_rot_ref = rotor_centers[0]
 if SCENARIO == 1:
     # Apart: place the ball left of the rotor rim with a gap
     # Rim along -x direction lies at x = c_rot_ref.x - rotor_radius
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball + 1.0),
-                          c_rot_ref[1]- (rotor_radius - 5),
-                          c_rot_ref[2]+ 1.0])
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 10.0),
+                          c_rot_ref[1]- (rotor_radius + 0.0),
+                          c_rot_ref[2]+ 10.0])
 elif SCENARIO == 2:
     # Just touching: tangent to the rotor rim along -x
     c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball),
@@ -127,7 +127,7 @@ elif SCENARIO == 2:
                           c_rot_ref[2]])
 else:
     # Overlap: penetrate by 1.5 along -x
-    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 0.2),
+    c_ball_np = np.array([c_rot_ref[0] - (rotor_radius + r_ball - 5.0),
                           c_rot_ref[1],
                           c_rot_ref[2]])
 
@@ -137,8 +137,8 @@ phi_ball = prim.sdf_sphere(center=c_ball_np, radius=r_ball)
 phi_union = op.union(phi_drone, phi_ball)
 
 # === Collision check (drone vs ball) ===
-x0_mid_np = 0.5 * (c_ball_np + c_rot_ref)       # Midpoint Seed
-#x0_mid_np = c_ball_np + 3E-1                    #Test gate offset
+#x0_mid_np = 0.5 * (c_ball_np + c_rot_ref)       # Midpoint Seed
+x0_mid_np = body_center                     #Test gate offset
 x0 = csdl.Variable(value=x0_mid_np)   
 eta_max = csdl.Variable(value = 0.3)
 
