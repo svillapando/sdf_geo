@@ -410,9 +410,9 @@ def collision_check(
     # choose seeds
     if len(C_A_top) == 1:
         a0 = C_A_top[0]; b0 = C_B_top[0]
-        print("Phi_A_top:", phi_A_numeric_world(a0)); print("Phi_B_top:", phi_B_numeric_world(b0));
-        print("Top-1 MNN pair:", a0, b0)
-        print("Midpoint C:", 0.5*(a0+b0))
+        # print("Phi_A_top:", phi_A_numeric_world(a0)); print("Phi_B_top:", phi_B_numeric_world(b0));
+        # print("Top-1 MNN pair:", a0, b0)
+        # print("Midpoint C:", 0.5*(a0+b0))
         # --- pick gamma from seed balance ---
         a0 = C_A_top[0]; b0 = C_B_top[0]
         d0 = float(np.linalg.norm(a0 - b0))
