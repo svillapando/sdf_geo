@@ -11,628 +11,116 @@ from typing import Callable, Dict, Tuple, List, Optional, Union
 import numpy as np
 import csdl_alpha as csdl
 
-# ---------- helpers shared by both phases ----------
-_DEF_EPS = 1e-12
+# # ---------- helpers shared by both phases ----------
+# _DEF_EPS = 1e-12
 
-def _as_array(x, shape=None):
-    arr = np.asarray(getattr(x, 'value', x), float)
-    return arr if shape is None else arr.reshape(shape)
+# def _as_array(x, shape=None):
+#     arr = np.asarray(getattr(x, 'value', x), float)
+#     return arr if shape is None else arr.reshape(shape)
 
-def _quat_to_R_wb(q):
-    """Rotation (WORLD ← BODY) from quaternion q=[w,x,y,z] (numpy)."""
-    w, x, y, z = q
-    n = np.linalg.norm(q)
-    if n == 0:
-        return np.eye(3)
-    w, x, y, z = q / n
-    return np.array([
-        [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
-    ])
+# def _quat_to_R_wb(q):
+#     """Rotation (WORLD ← BODY) from quaternion q=[w,x,y,z] (numpy)."""
+#     w, x, y, z = q
+#     n = np.linalg.norm(q)
+#     if n == 0:
+#         return np.eye(3)
+#     w, x, y, z = q / n
+#     return np.array([
+#         [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+#         [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+#         [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
+#     ])
 
-def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
-    """Quaternion [w,x,y,z] -> 3x3 rotation (CSDL). Normalizes internally."""
-    qw, qx, qy, qz = q[0], q[1], q[2], q[3]
-    nrm = csdl.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) + _DEF_EPS
-    qw, qx, qy, qz = qw/nrm, qx/nrm, qy/nrm, qz/nrm
-    r00 = 1.0 - 2.0*(qy*qy + qz*qz)
-    r01 = 2.0*(qx*qy - qw*qz)
-    r02 = 2.0*(qx*qz + qw*qy)
-    r10 = 2.0*(qx*qy + qw*qz)
-    r11 = 1.0 - 2.0*(qx*qx + qz*qz)
-    r12 = 2.0*(qy*qz - qw*qx)
-    r20 = 2.0*(qx*qz - qw*qy)
-    r21 = 2.0*(qy*qz + qw*qx)
-    r22 = 1.0 - 2.0*(qx*qx + qy*qy)
-    R_flat = csdl.vstack((r00, r01, r02, r10, r11, r12, r20, r21, r22))
-    return csdl.reshape(R_flat, (3, 3))
+# def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
+#     """Quaternion [w,x,y,z] -> 3x3 rotation (CSDL). Normalizes internally."""
+#     qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+#     nrm = csdl.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) + _DEF_EPS
+#     qw, qx, qy, qz = qw/nrm, qx/nrm, qy/nrm, qz/nrm
+#     r00 = 1.0 - 2.0*(qy*qy + qz*qz)
+#     r01 = 2.0*(qx*qy - qw*qz)
+#     r02 = 2.0*(qx*qz + qw*qy)
+#     r10 = 2.0*(qx*qy + qw*qz)
+#     r11 = 1.0 - 2.0*(qx*qx + qz*qz)
+#     r12 = 2.0*(qy*qz - qw*qx)
+#     r20 = 2.0*(qx*qz - qw*qy)
+#     r21 = 2.0*(qy*qz + qw*qx)
+#     r22 = 1.0 - 2.0*(qx*qx + qy*qy)
+#     R_flat = csdl.vstack((r00, r01, r02, r10, r11, r12, r20, r21, r22))
+#     return csdl.reshape(R_flat, (3, 3))
 
-# ---------- main entry ----------
-def collision_check(
-    phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
-    phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
-    pos_w_m: csdl.Variable,
-    quat_wxyz: csdl.Variable,
-    *,
-    b_seed_center_w_m: np.ndarray,    # e.g., gate center
-    max_refine: int = 8,
-    enable_phase2: bool = True,
-    plot_octree: bool = True,
-    plot_kkt: bool = True,
-    gamma: float = 50.0,
-    newton_tol: float = 1e-8,
-    recorder: Optional[csdl.Recorder] = None
-) -> Dict[str, object]:
-    """
-    Returns a dict with:
-      - keptA, halfA, intervalsA, keptB, halfB, intervalsB (by level)
-      - mnn_pairs (final), C_A_top (1,3), C_B_top (1,3)
-      - KKT: m, F_star, a, b, pair_gap  (csdl.Variables)
-    """
-
-    # =============== OFFLINE: dual-sided octree + MNN (pause main recorder) ===============
-    if recorder is not None:
-        recorder.stop()
-    dummy = csdl.Recorder(inline=True); dummy.start()
-
-    # pose (numpy)
-    p_w  = _as_array(pos_w_m, (3,))
-    R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
-
-    # numeric wrappers
-    def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
-        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-        P_b_m  = (P_w_m - p_w) @ R_wb.T
-        P_b_cm = 100.0 * P_b_m
-        vals_cm = phi_A_body_cm(csdl.Variable(value=P_b_cm)).value
-        return 0.01 * np.asarray(vals_cm).reshape(-1)
-
-    def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
-        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-        vals = phi_B_world_m(csdl.Variable(value=P_w_m)).value
-        return np.asarray(vals).reshape(-1)
-
-    # voxel structure
-    class Voxels:
-        def __init__(self, nodes: np.ndarray, L: int, bounds):
-            self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
-            self.L = int(L)
-            self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
-        @classmethod
-        def root(cls, bounds):
-            return cls(nodes=np.array([[0,0,0]]), L=0, bounds=bounds)
-        def _sizes(self):
-            W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
-            n = 1 << self.L
-            dx, dy, dz = W/n, H/n, D/n
-            hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
-            return dx, dy, dz, hx, hy, hz
-        def centers(self):
-            dx, dy, dz, _, _, _ = self._sizes()
-            i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
-            cx = self.xmin + (i + 0.5) * dx
-            cy = self.ymin + (j + 0.5) * dy
-            cz = self.zmin + (k + 0.5) * dz
-            return np.column_stack([cx, cy, cz])
-        def half_sizes(self):
-            _, _, _, hx, hy, hz = self._sizes()
-            return float(hx), float(hy), float(hz)
-        def radius(self):
-            hx, hy, hz = self.half_sizes()
-            return float(np.sqrt(hx*hx + hy*hy + hz*hz))
-        def subdivide(self):
-            i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
-            kids = np.array([
-                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
-            ]).reshape(-1, 3)
-            return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
-        def restrict(self, mask):
-            self.nodes = self.nodes[np.asarray(mask, bool)]
-
-    # robust autosize (minimal tweak): ensure half ≥ |φ(seed)| + margin
-    def _autosize_root_bbox_from(phi_fn_numeric, seed_center, hit_thresh=0.01, ray_max=0.80, margin=0.05):
-        dirs = []
-        s = 1/np.sqrt(2); t = 1/np.sqrt(3)
-        axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
-        edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],
-                 [+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
-                 [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
-        corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],
-                   [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
-        for d in axes + edges + corners:
-            v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
-
-        radii = np.linspace(0.05, ray_max, 32)
-        max_hit = 0.25
-        for d in dirs:
-            points = seed_center[None,:] + radii[:,None]*d[None,:]
-            phis = phi_fn_numeric(points)
-            if (phis > hit_thresh).any():
-                idx = np.argmax(phis > hit_thresh)
-                hit_r = radii[min(idx+1, len(radii)-1)]
-            else:
-                hit_r = radii[-1]
-            max_hit = max(max_hit, float(hit_r))
-
-        half = max_hit + margin
-        phi0 = float(phi_fn_numeric(np.asarray(seed_center, float).reshape(1, -1))[0])
-        half = max(half, abs(phi0) + margin)
-
-        return (seed_center[0]-half, seed_center[0]+half,
-                seed_center[1]-half, seed_center[1]+half,
-                seed_center[2]-half, seed_center[2]+half)
-
-    # A-centric (seed at drone) and B-centric (seed at gate center)
-    rootA = _autosize_root_bbox_from(phi_A_numeric_world, p_w)
-    b_seed = np.asarray(b_seed_center_w_m, float).reshape(3,)
-    rootB = _autosize_root_bbox_from(phi_B_numeric_world, b_seed)
-
-    # one refinement step (A side)
-    def _refine_once_A(vox: "Voxels"):
-        vox = vox.subdivide()
-        r   = vox.radius()
-        C   = vox.centers()
-        keep1 = (phi_A_numeric_world(C) <= r)                    # Phase-1(A)
-        vox.restrict(keep1)
-        interval = (np.nan, np.nan)
-        if enable_phase2 and len(vox.nodes) > 0:
-            C2   = vox.centers()
-            phiB = phi_B_numeric_world(C2)
-            min_u = np.min(phiB) + r                              # “old” +r then +r → +2r window
-            keep2 = (phiB <= (min_u + r))                         # Phase-2(A)
-            vox.restrict(keep2)
-            interval = (min_u - 2.0*r, min_u)
-        return vox, interval
-
-    # one refinement step (B side)
-    def _refine_once_B(vox: "Voxels"):
-        vox = vox.subdivide()
-        r   = vox.radius()
-        C   = vox.centers()
-        keep1 = (phi_B_numeric_world(C) <= r)                    # Phase-1(B)
-        vox.restrict(keep1)
-        interval = (np.nan, np.nan)
-        if enable_phase2 and len(vox.nodes) > 0:
-            C2   = vox.centers()
-            phiA = phi_A_numeric_world(C2)
-            min_u = np.min(phiA) + r
-            keep2 = (phiA <= (min_u + r))                         # Phase-2(B)
-            vox.restrict(keep2)
-            interval = (min_u - 2.0*r, min_u)
-        return vox, interval
-
-    # run refinements
-    voxA = Voxels.root(rootA)
-    keptA, intervalsA, halfA = {0: voxA.centers().copy()}, {0: (np.nan, np.nan)}, {0: voxA.half_sizes()}
-    for L in range(max_refine):
-        voxA, interA = _refine_once_A(voxA)
-        keptA[L+1]      = voxA.centers().copy()
-        intervalsA[L+1] = interA
-        halfA[L+1]      = voxA.half_sizes()
-
-    voxB = Voxels.root(rootB)
-    keptB, intervalsB, halfB = {0: voxB.centers().copy()}, {0: (np.nan, np.nan)}, {0: voxB.half_sizes()}
-    for L in range(max_refine):
-        voxB, interB = _refine_once_B(voxB)
-        keptB[L+1]      = voxB.centers().copy()
-        intervalsB[L+1] = interB
-        halfB[L+1]      = voxB.half_sizes()
-
-    # final clouds
-    C_A_final = keptA[max_refine]
-    C_B_final = keptB[max_refine]
-    hxA, hyA, hzA = halfA[max_refine]
-    hxB, hyB, hzB = halfB[max_refine]
-    rA = float(np.linalg.norm([hxA, hyA, hzA]))
-    rB = float(np.linalg.norm([hxB, hyB, hzB]))
-
-    # MNN pairs
-    mnn_pairs: List[Tuple[int,int]] = []
-    if len(C_A_final) > 0 and len(C_B_final) > 0:
-        d2 = np.sum((C_A_final[:,None,:] - C_B_final[None,:,:])**2, axis=2)
-        nnB_of_A = np.argmin(d2, axis=1)
-        nnA_of_B = np.argmin(d2, axis=0)
-        for iA, jB in enumerate(nnB_of_A):
-            if nnA_of_B[jB] == iA:
-                mnn_pairs.append((iA, jB))
-
-    # rank and take top-1
-    def _pair_score(iA, jB):
-        a = phi_A_numeric_world(C_A_final[iA:iA+1])[0]
-        b = phi_B_numeric_world(C_B_final[jB:jB+1])[0]
-        dist = float(np.linalg.norm(C_A_final[iA] - C_B_final[jB]))
-        return np.sqrt(a*a + b*b) + dist - (rA + rB)
-
-    C_A_top = np.zeros((0,3)); C_B_top = np.zeros((0,3)); top_pair = None
-    if mnn_pairs:
-        scores = np.array([_pair_score(iA, jB) for (iA, jB) in mnn_pairs], float)
-        order  = np.argsort(scores)
-        idx0   = int(order[0])
-        top_pair = mnn_pairs[idx0]
-        C_A_top = C_A_final[[top_pair[0]]]
-        C_B_top = C_B_final[[top_pair[1]]]
-
-    # restore main recorder for online KKT
-    dummy.stop()
-    if recorder is not None:
-        recorder.start()
-
-    # optional OCTREE plotting
-    if plot_octree:
-        try:
-            import pyvista as pv
-            # bounds union helper
-            def _cloud_bounds(C, h):
-                if len(C)==0: return None
-                hx, hy, hz = h
-                H = np.tile(np.array([hx, hy, hz], float), (len(C), 1))
-                mins = C - H; maxs = C + H
-                return mins.min(axis=0), maxs.max(axis=0)
-
-            bA = _cloud_bounds(keptA[max_refine], halfA[max_refine])
-            bB = _cloud_bounds(keptB[max_refine], halfB[max_refine])
-            if bA and bB:
-                mins = np.minimum(bA[0], bB[0]); maxs = np.maximum(bA[1], bB[1])
-            elif bA: mins, maxs = bA
-            elif bB: mins, maxs = bB
-            else:
-                mins = np.array([rootA[0], rootA[2], rootA[4]])
-                maxs = np.array([rootA[1], rootA[3], rootA[5]])
-            pad = 0.35
-            xmin, ymin, zmin = mins - pad; xmax, ymax, zmax = maxs + pad
-
-            Nx = Ny = Nz = 96
-            x = np.linspace(xmin, xmax, Nx)
-            y = np.linspace(ymin, ymax, Ny)
-            z = np.linspace(zmin, zmax, Nz)
-            X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
-            P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-            phiA = phi_A_numeric_world(P).reshape(X.shape)
-            phiB = phi_B_numeric_world(P).reshape(X.shape)
-
-            plotter = pv.Plotter()
-            # φA=0
-            if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
-                gridA = pv.ImageData()
-                gridA.dimensions = np.array(phiA.shape)
-                gridA.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
-                gridA.origin    = (x[0], y[0], z[0])
-                gridA.point_data["phiA"] = phiA.flatten(order="F")
-                contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
-                plotter.add_mesh(contA, color="royalblue", opacity=0.55)
-            # φB=0
-            if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
-                gridB = pv.ImageData()
-                gridB.dimensions = np.array(phiB.shape)
-                gridB.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
-                gridB.origin    = (x[0], y[0], z[0])
-                gridB.point_data["phiB"] = phiB.flatten(order="F")
-                contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
-                plotter.add_mesh(contB, color="tomato", opacity=0.55)
-
-            # wireframe voxels (no pair lines)
-            MAX_DRAW = 1500
-            CdrawA = keptA[max_refine]; stepA = max(1, len(CdrawA)//MAX_DRAW if len(CdrawA) else 1)
-            hxA, hyA, hzA = halfA[max_refine]
-            for i in range(0, len(CdrawA), stepA):
-                cx, cy, cz = CdrawA[i]
-                cube = pv.Cube(center=(cx, cy, cz),
-                               x_length=2*hxA, y_length=2*hyA, z_length=2*hzA)
-                plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
-
-            CdrawB = keptB[max_refine]; stepB = max(1, len(CdrawB)//MAX_DRAW if len(CdrawB) else 1)
-            hxB, hyB, hzB = halfB[max_refine]
-            for i in range(0, len(CdrawB), stepB):
-                cx, cy, cz = CdrawB[i]
-                cube = pv.Cube(center=(cx, cy, cz),
-                               x_length=2*hxB, y_length=2*hyB, z_length=2*hzB)
-                plotter.add_mesh(cube, style="wireframe", color="cyan", line_width=1.0, opacity=0.85)
-
-            plotter.show_bounds(grid='front', location='outer', color='black',
-                                xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
-            plotter.add_axes(); plotter.add_title("Two-Sided Broad-Phase: A(yellow) / B(cyan)")
-            plotter.camera_position = 'iso'
-            plotter.show()
-        except Exception as e:
-            print("[octree viz] skipped:", e)
-
-        # level diagnostics
-        try:
-            import matplotlib.pyplot as plt
-            levels = sorted(keptA.keys())
-            cntA = [len(keptA[L]) for L in levels]
-            cntB = [len(keptB[L]) for L in levels]
-            lowsA  = [intervalsA[L][0] for L in levels]
-            uppsA  = [intervalsA[L][1] for L in levels]
-            midsA  = [0.5*(l+u) for l,u in zip(lowsA, uppsA)]
-            lowsB  = [intervalsB[L][0] for L in levels]
-            uppsB  = [intervalsB[L][1] for L in levels]
-            midsB  = [0.5*(l+u) for l,u in zip(lowsB, uppsB)]
-            fig, axs = plt.subplots(1,3, figsize=(14,4))
-            axs[0].plot(levels, cntA, marker='o', label='A kept')
-            axs[0].plot(levels, cntB, marker='s', label='B kept')
-            axs[0].set_xlabel("L"); axs[0].set_ylabel("# voxels kept"); axs[0].legend(); axs[0].grid(alpha=0.3)
-            axs[1].plot(levels, lowsA, marker='v', label='A lower')
-            axs[1].plot(levels, uppsA, marker='^', label='A upper')
-            axs[1].plot(levels, midsA, marker='o', linestyle='--', label='A mid')
-            axs[1].set_xlabel("L"); axs[1].set_ylabel("Bracket on min φ_B"); axs[1].legend(); axs[1].grid(alpha=0.3)
-            axs[2].plot(levels, lowsB, marker='v', label='B lower')
-            axs[2].plot(levels, uppsB, marker='^', label='B upper')
-            axs[2].plot(levels, midsB, marker='o', linestyle='--', label='B mid')
-            axs[2].set_xlabel("L"); axs[2].set_ylabel("Bracket on min φ_A"); axs[2].legend(); axs[2].grid(alpha=0.3)
-            plt.suptitle(f"MNN pairs @final: {len(mnn_pairs)} (top-1 shown: {len(C_A_top)})")
-            plt.show()
-        except Exception as e:
-            print("[octree plots] skipped:", e)
-
-    # =============== ONLINE: penalized KKT (seeded by top-1 pair) =========================
-    # CSDL SDFs in world (m)
-    def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
-        R_wb = quat_to_rm_csdl(quat_wxyz)
-        R_bw = csdl.transpose(R_wb)
-        if p_w.shape == (3,):
-            rel_w  = p_w - pos_w_m
-            x_b_cm = 100.0 * csdl.matvec(R_bw, rel_w)
-            return phi_A_body_cm(x_b_cm) / 100.0
-        K = p_w.shape[0]
-        pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')
-        rel_w  = p_w - pos_tiled
-        x_b_cm = 100.0 * csdl.matmat(rel_w, csdl.transpose(R_bw))
-        return phi_A_body_cm(x_b_cm) / 100.0
-
-    # penalty KKT with independent seeds for a,b
-    def penalty_kkt_pair(phi_A, phi_B, a0_np, b0_np, gamma=50.0, newton_tol=1e-8, name="penalty_kkt"):
-        a = csdl.Variable(name=f"{name}:a", shape=(3,), value=a0_np)
-        b = csdl.Variable(name=f"{name}:b", shape=(3,), value=b0_np)
-        phiA = phi_A(a);  phiB = phi_B(b)
-        gA = csdl.reshape(csdl.derivative(ofs=phiA, wrts=a), (3,))
-        gB = csdl.reshape(csdl.derivative(ofs=phiB, wrts=b), (3,))
-        R_a = (a - b) + gamma * phiA * gA
-        R_b = (b - a) + gamma * phiB * gB
-        solver = csdl.nonlinear_solvers.Newton(name, tolerance=newton_tol)
-        solver.add_state(a, R_a, initial_value=a0_np)
-        solver.add_state(b, R_b, initial_value=b0_np)
-        solver.run()
-        m = 0.5*(a+b)
-        F_star = csdl.maximum(phi_A(m), phi_B(m), rho=20.0) - 0.05
-        #diff = a - b
-        #gap = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
-        return m, F_star, a, b
-
-    # choose seeds
-    if len(C_A_top) == 1:
-        a0 = C_A_top[0]; b0 = C_B_top[0]
-        # print("Phi_A_top:", phi_A_numeric_world(a0)); print("Phi_B_top:", phi_B_numeric_world(b0));
-        # print("Top-1 MNN pair:", a0, b0)
-        # print("Midpoint C:", 0.5*(a0+b0))
-        # --- pick gamma from seed balance ---
-        a0 = C_A_top[0]; b0 = C_B_top[0]
-        d0 = float(np.linalg.norm(a0 - b0))
-        phiA0 = phi_A_numeric_world(a0)
-        phiB0 = phi_B_numeric_world(b0)
-        phi_bar = max(1e-4, 0.5*(abs(phiA0) + abs(phiB0)))   # guard
-        gamma_bal = np.clip(d0 / phi_bar, 5.0, 300.0)        # seed-balanced gamma
-
-        m, F_star, a, b = penalty_kkt_pair(phi_A_world_m, phi_B_world_m,
-                                                    a0, b0,
-                                                    gamma=gamma_bal, newton_tol=newton_tol,
-                                                    name="collision_kkt_gbal")
-        # # --- (optional) two-stage continuation for robustness ---
-        # gammas = [0.5*gamma_bal, gamma_bal, 0.5*(gamma_bal+gamma), gamma]  # last is your target (e.g., 50)
-        # a_init, b_init = a0, b0
-        # for g in gammas:
-        #     m, F_star, a, b, pair_gap = penalty_kkt_pair(phi_A_world_m, phi_B_world_m,
-        #                                                 a_init, b_init,
-        #                                                 gamma=g, newton_tol=newton_tol,
-        #                                                 name=f"collision_kkt_g{g:.1f}")
-        #     # warm start next stage
-        #     a_init = np.asarray(a.value).reshape(3)
-        #     b_init = np.asarray(b.value).reshape(3)
-
-    else:
-        # fallback: midpoint between drone and gate center if no pairs
-        mid = 0.5*(p_w + b_seed)
-        print("Midpoint fallback:", mid)
-        m, F_star, a, b = penalty_kkt_pair(phi_A_world_m, phi_B_world_m, mid, mid,
-                                                     gamma=gamma, newton_tol=newton_tol, name="collision_kkt_fallback")
-
-    # optional KKT plotting
-    if plot_kkt:
-        try:
-            import pyvista as pv
-            # quick grids (drone tight; gate broader)
-            pos_np = np.asarray(pos_w_m.value)
-            d_half = 0.22
-            bounds_drone = ((pos_np[0]-d_half, pos_np[0]+d_half),
-                            (pos_np[1]-d_half, pos_np[1]+d_half),
-                            (pos_np[2]-d_half, pos_np[2]+d_half))
-            g_half = np.array([1.0, 1.5, 1.5])  # rough sphere/box max with margin
-            gcen  = b_seed
-            bounds_gate = ((gcen[0]-g_half[0], gcen[0]+g_half[0]),
-                           (gcen[1]-g_half[1], gcen[1]+g_half[1]),
-                           (gcen[2]-g_half[2], gcen[2]+g_half[2]))
-            def contour_zero(phi_fn, bounds, dx, scal_name):
-                if not hasattr(pv, "ImageData"): raise RuntimeError("PyVista ImageData missing")
-                (xmin,xmax),(ymin,ymax),(zmin,zmax) = bounds
-                nx = int(np.floor((xmax-xmin)/dx))+1
-                ny = int(np.floor((ymax-ymin)/dx))+1
-                nz = int(np.floor((zmax-zmin)/dx))+1
-                grid = pv.ImageData()
-                grid.dimensions = (nx,ny,nz); grid.origin=(xmin,ymin,zmin); grid.spacing=(dx,dx,dx)
-                P = np.asarray(grid.points)
-                vals = phi_fn(csdl.Variable(value=P.astype(float))).value.reshape(-1)
-                grid[scal_name] = vals
-                return grid.contour(isosurfaces=[0.0], scalars=scal_name)
-
-            surf_A = contour_zero(phi_A_world_m, bounds_drone, 0.01, "phiA")
-            surf_B = contour_zero(phi_B_world_m, bounds_gate,  0.04, "phiB")
-
-            a_np = np.asarray(a.value).reshape(3)
-            b_np = np.asarray(b.value).reshape(3)
-            m_np = np.asarray(m.value).reshape(3)
-            s_a = pv.Sphere(radius=0.010, center=a_np)
-            s_b = pv.Sphere(radius=0.010, center=b_np)
-            s_m = pv.Sphere(radius=0.008, center=m_np)
-
-            p = pv.Plotter()
-            p.add_mesh(surf_A, color="#1f77b4", opacity=0.75, smooth_shading=True, label="Drone (A=0)")
-            p.add_mesh(surf_B, color="#f46c6c", opacity=0.35, smooth_shading=True, label="Gate (B=0)")
-            p.add_mesh(s_a, color="#bc2525"); p.add_mesh(s_b, color="#9467bd"); p.add_mesh(s_m, color="#ffdd57")
-            p.add_axes(line_width=2); p.add_legend(bcolor="black", border=True)
-            p.set_background("black", top="dimgray"); p.camera_position="iso"
-            p.show(title="Penalty KKT: φA=0, φB=0, witnesses a/b, midpoint m")
-        except Exception as e:
-            print("[kkt viz] skipped:", e)
-
-    # return dict(
-    #     keptA=keptA, halfA=halfA, intervalsA=intervalsA,
-    #     keptB=keptB, halfB=halfB, intervalsB=intervalsB,
-    #     mnn_pairs=mnn_pairs, C_A_top=C_A_top, C_B_top=C_B_top,
-    #     m=m, F_star=F_star, a=a, b=b, pair_gap=pair_gap
-    # )
-    return m, F_star, a, b
-
-
-# =============== END HYBRID METHOD ===============
-
-
+# # ---------- main entry ----------
 # def collision_check(
 #     phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
 #     phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
 #     pos_w_m: csdl.Variable,
 #     quat_wxyz: csdl.Variable,
-#     recorder: csdl.Recorder = None,
 #     *,
+#     b_seed_center_w_m: np.ndarray,    # e.g., gate center
 #     max_refine: int = 8,
 #     enable_phase2: bool = True,
-#     K: int = 5,
-#     plot: bool = False,
-# ) -> Tuple[Dict[int, np.ndarray], Dict[int, Tuple[float, float, float]], csdl.Variable, csdl.Variable, np.ndarray]:
+#     plot_octree: bool = True,
+#     plot_kkt: bool = True,
+#     gamma: float = 50.0,
+#     newton_tol: float = 1e-8,
+#     recorder: Optional[csdl.Recorder] = None
+# ) -> Dict[str, object]:
 #     """
-#     Octree broad-phase + (small) differentiable narrow-phase aggregator for two SDFs.
-
-#     Assumptions
-#     ----------
-#     • phi_A_body_cm : evaluates points given in DRONE BODY frame **centimeters** (returns cm)
-#     • phi_B_world_m : evaluates points given in WORLD frame **meters** (returns m)
-#     • The drone pose (pos, quat) maps WORLD→BODY; we convert WORLD meters to BODY cm for φ_A.
-
-#     Parameters
-#     ----------
-#     phi_A_body_cm : Callable[[csdl.Variable], csdl.Variable]
-#         CSDL SDF for object A (drone) in body/cm.
-#     phi_B_world_m : Callable[[csdl.Variable], csdl.Variable]
-#         CSDL SDF for object/obstacle B in world/m.
-#     pos_w_m : csdl.Variable (shape (3,))
-#         Drone position in world coordinates (meters).
-#     quat_wxyz : csdl.Variable (shape (4,))
-#         World-from-body quaternion in (w,x,y,z) order.
-#     max_refine : int, default 8
-#         Octree depth (number of refinement iterations).
-#     enable_phase2 : bool, default True
-#         If True, apply extra culling using φ_B at voxel centers.
-#     K : int, default 5
-#         Number of top candidate voxels to feed the differentiable aggregator.
-#     plot : bool, default False
-#         If True, produce PyVista/Matplotlib visualizations.
-
-#     Returns
-#     -------
-#     kept3d : dict[int, (N_L,3) np.ndarray]
-#         Per refinement level L ∈ {0..max_refine}, voxel centers kept (WORLD, m).
-#     halfsizes : dict[int, (hx,hy,hz)]
-#         Per level voxel half-sizes (WORLD, m).
-#     d_soft : csdl.Variable (scalar)
-#         Differentiable conservative distance-like metric (soft-min over K candidates).
-#     stack : csdl.Variable (K, 1)
-#         The per-candidate conservative intersection values before soft-min.
-#     C_top : (K,3) np.ndarray
-#         WORLD (m) coordinates of the K candidates used in the differentiable stage.
+#     Returns a dict with:
+#       - keptA, halfA, intervalsA, keptB, halfB, intervalsB (by level)
+#       - mnn_pairs (final), C_A_top (1,3), C_B_top (1,3)
+#       - KKT: m, F_star, a, b, pair_gap  (csdl.Variables)
 #     """
 
-#     # -----------------------
-#     # Helpers (NumPy path)
-#     # -----------------------
-#     def _as_array(x, shape):
-#         return np.asarray(getattr(x, 'value', x), float).reshape(shape)
+#     # =============== OFFLINE: dual-sided octree + MNN (pause main recorder) ===============
+#     if recorder is not None:
+#         recorder.stop()
+#     dummy = csdl.Recorder(inline=True); dummy.start()
 
-#     def _quat_to_R_wb(q):
-#         """Rotation matrix (WORLD ← BODY) from quaternion (w,x,y,z)."""
-#         w, x, y, z = q
-#         n = np.linalg.norm(q)
-#         if n == 0:
-#             return np.eye(3)
-#         w, x, y, z = q / n
-#         return np.array([
-#             [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
-#             [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-#             [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
-#         ])
-
+#     # pose (numpy)
 #     p_w  = _as_array(pos_w_m, (3,))
 #     R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
 
+#     # numeric wrappers
 #     def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
 #         P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-#         P_b_m  = (P_w_m - p_w) @ R_wb.T        # world→body (meters)
-#         P_b_cm = 100.0 * P_b_m                 # meters→centimeters
-#         vals_cm = phi_A_body_cm(P_b_cm).value  # cm
-#         return 0.01 * np.asarray(vals_cm).reshape(-1)  # meters
+#         P_b_m  = (P_w_m - p_w) @ R_wb.T
+#         P_b_cm = 100.0 * P_b_m
+#         vals_cm = phi_A_body_cm(csdl.Variable(value=P_b_cm)).value
+#         return 0.01 * np.asarray(vals_cm).reshape(-1)
 
 #     def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
 #         P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-#         vals = phi_B_world_m(P_w_m).value
+#         vals = phi_B_world_m(csdl.Variable(value=P_w_m)).value
 #         return np.asarray(vals).reshape(-1)
 
-#     # Freeze current recorder for broad-phase, use dummy recorder for now
-#     recorder.stop()
-#     dummy = csdl.Recorder(inline=True)
-#     dummy.start()
-
-#     # -----------------------
-#     # Voxel structure
-#     # -----------------------
+#     # voxel structure
 #     class Voxels:
-#         def __init__(self, nodes: np.ndarray, L: int, bounds: Tuple[float, float, float, float, float, float]):
+#         def __init__(self, nodes: np.ndarray, L: int, bounds):
 #             self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
 #             self.L = int(L)
 #             self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
-
 #         @classmethod
 #         def root(cls, bounds):
-#             return cls(nodes=np.array([[0,0,0]], dtype=np.int64), L=0, bounds=bounds)
-
+#             return cls(nodes=np.array([[0,0,0]]), L=0, bounds=bounds)
 #         def _sizes(self):
 #             W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
 #             n = 1 << self.L
 #             dx, dy, dz = W/n, H/n, D/n
 #             hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
 #             return dx, dy, dz, hx, hy, hz
-
-#         def centers(self) -> np.ndarray:
+#         def centers(self):
 #             dx, dy, dz, _, _, _ = self._sizes()
 #             i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
 #             cx = self.xmin + (i + 0.5) * dx
 #             cy = self.ymin + (j + 0.5) * dy
 #             cz = self.zmin + (k + 0.5) * dz
 #             return np.column_stack([cx, cy, cz])
-
-#         def half_sizes(self) -> Tuple[float, float, float]:
+#         def half_sizes(self):
 #             _, _, _, hx, hy, hz = self._sizes()
 #             return float(hx), float(hy), float(hz)
-
-#         def radius(self) -> float:
+#         def radius(self):
 #             hx, hy, hz = self.half_sizes()
 #             return float(np.sqrt(hx*hx + hy*hy + hz*hz))
-
 #         def subdivide(self):
 #             i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
 #             kids = np.array([
@@ -646,14 +134,11 @@ def collision_check(
 #                 np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
 #             ]).reshape(-1, 3)
 #             return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
-
-#         def restrict(self, mask: np.ndarray):
+#         def restrict(self, mask):
 #             self.nodes = self.nodes[np.asarray(mask, bool)]
 
-#     # -----------------------
-#     # Auto-size root bounds by probing φ_A in world space
-#     # -----------------------
-#     def _autosize_root_bbox() -> Tuple[float, float, float, float, float, float]:
+#     # robust autosize (minimal tweak): ensure half ≥ |φ(seed)| + margin
+#     def _autosize_root_bbox_from(phi_fn_numeric, seed_center, hit_thresh=0.01, ray_max=0.80, margin=0.05):
 #         dirs = []
 #         s = 1/np.sqrt(2); t = 1/np.sqrt(3)
 #         axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
@@ -664,133 +149,145 @@ def collision_check(
 #                    [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
 #         for d in axes + edges + corners:
 #             v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
-#         radii = np.linspace(0.05, 0.80, 32)  # meters
-#         max_hit = 0.25; margin = 0.05
+
+#         radii = np.linspace(0.05, ray_max, 32)
+#         max_hit = 0.25
 #         for d in dirs:
-#             phis = [phi_A_numeric_world([p_w + r*d])[0] for r in radii]
-#             phis = np.asarray(phis)
-#             if (phis > 0.01).any():
-#                 idx = np.argmax(phis > 0.01)
+#             points = seed_center[None,:] + radii[:,None]*d[None,:]
+#             phis = phi_fn_numeric(points)
+#             if (phis > hit_thresh).any():
+#                 idx = np.argmax(phis > hit_thresh)
 #                 hit_r = radii[min(idx+1, len(radii)-1)]
 #             else:
 #                 hit_r = radii[-1]
 #             max_hit = max(max_hit, float(hit_r))
+
 #         half = max_hit + margin
-#         return (p_w[0]-half, p_w[0]+half, p_w[1]-half, p_w[1]+half, p_w[2]-half, p_w[2]+half)
+#         phi0 = float(phi_fn_numeric(np.asarray(seed_center, float).reshape(1, -1))[0])
+#         half = max(half, abs(phi0) + margin)
 
-#     root_bounds = _autosize_root_bbox()
+#         return (seed_center[0]-half, seed_center[0]+half,
+#                 seed_center[1]-half, seed_center[1]+half,
+#                 seed_center[2]-half, seed_center[2]+half)
 
-#     # -----------------------
-#     # One refinement step
-#     # -----------------------
-#     def _refine_once(vox: "Voxels"):
+#     # A-centric (seed at drone) and B-centric (seed at gate center)
+#     rootA = _autosize_root_bbox_from(phi_A_numeric_world, p_w)
+#     b_seed = np.asarray(b_seed_center_w_m, float).reshape(3,)
+#     rootB = _autosize_root_bbox_from(phi_B_numeric_world, b_seed)
+
+#     # one refinement step (A side)
+#     def _refine_once_A(vox: "Voxels"):
 #         vox = vox.subdivide()
 #         r   = vox.radius()
 #         C   = vox.centers()
-#         keep1 = (phi_A_numeric_world(C) <= r)     # Phase-1 on φ_A
+#         keep1 = (phi_A_numeric_world(C) <= r)                    # Phase-1(A)
 #         vox.restrict(keep1)
-
 #         interval = (np.nan, np.nan)
 #         if enable_phase2 and len(vox.nodes) > 0:
-#             C2 = vox.centers()
+#             C2   = vox.centers()
 #             phiB = phi_B_numeric_world(C2)
-#             min_u = np.min(phiB) + r
-#             keep2 = (phiB <= (min_u + r))         # Phase-2 on φ_B
+#             min_u = np.min(phiB) + r                              # “old” +r then +r → +2r window
+#             keep2 = (phiB <= (min_u + r))                         # Phase-2(A)
 #             vox.restrict(keep2)
 #             interval = (min_u - 2.0*r, min_u)
 #         return vox, interval
 
-#     # -----------------------
-#     # Run refinement
-#     # -----------------------
-#     vox = Voxels.root(root_bounds)
-#     kept3d     = {0: vox.centers().copy()}
-#     intervals  = {0: (np.nan, np.nan)}
-#     halfsizes  = {0: vox.half_sizes()}
+#     # one refinement step (B side)
+#     def _refine_once_B(vox: "Voxels"):
+#         vox = vox.subdivide()
+#         r   = vox.radius()
+#         C   = vox.centers()
+#         keep1 = (phi_B_numeric_world(C) <= r)                    # Phase-1(B)
+#         vox.restrict(keep1)
+#         interval = (np.nan, np.nan)
+#         if enable_phase2 and len(vox.nodes) > 0:
+#             C2   = vox.centers()
+#             phiA = phi_A_numeric_world(C2)
+#             min_u = np.min(phiA) + r
+#             keep2 = (phiA <= (min_u + r))                         # Phase-2(B)
+#             vox.restrict(keep2)
+#             interval = (min_u - 2.0*r, min_u)
+#         return vox, interval
 
+#     # run refinements
+#     voxA = Voxels.root(rootA)
+#     keptA, intervalsA, halfA = {0: voxA.centers().copy()}, {0: (np.nan, np.nan)}, {0: voxA.half_sizes()}
 #     for L in range(max_refine):
-#         vox, inter = _refine_once(vox)
-#         kept3d[L+1]    = vox.centers().copy()
-#         intervals[L+1] = inter
-#         halfsizes[L+1] = vox.half_sizes()
+#         voxA, interA = _refine_once_A(voxA)
+#         keptA[L+1]      = voxA.centers().copy()
+#         intervalsA[L+1] = interA
+#         halfA[L+1]      = voxA.half_sizes()
 
-#     # -----------------------
-#     # Differentiable narrow-phase over top-K candidates
-#     # -----------------------
-#     C_final = kept3d[max_refine]
+#     voxB = Voxels.root(rootB)
+#     keptB, intervalsB, halfB = {0: voxB.centers().copy()}, {0: (np.nan, np.nan)}, {0: voxB.half_sizes()}
+#     for L in range(max_refine):
+#         voxB, interB = _refine_once_B(voxB)
+#         keptB[L+1]      = voxB.centers().copy()
+#         intervalsB[L+1] = interB
+#         halfB[L+1]      = voxB.half_sizes()
 
-#     hx, hy, hz = halfsizes[max_refine]
-#     r_cell = float(np.linalg.norm([hx, hy, hz]))  # half-diagonal of voxels at final level
+#     # final clouds
+#     C_A_final = keptA[max_refine]
+#     C_B_final = keptB[max_refine]
+#     hxA, hyA, hzA = halfA[max_refine]
+#     hxB, hyB, hzB = halfB[max_refine]
+#     rA = float(np.linalg.norm([hxA, hyA, hzA]))
+#     rB = float(np.linalg.norm([hxB, hyB, hzB]))
 
-#     # Rank candidates by conservative score φ_B(center) - r_cell
-#     phiB_centers = phi_B_numeric_world(C_final)
-#     scores = phiB_centers - r_cell
-#     order  = np.argsort(scores)
-#     k = int(min(K, len(order)))
-#     C_top = C_final[order[:k]]
+#     # MNN pairs
+#     mnn_pairs: List[Tuple[int,int]] = []
+#     if len(C_A_final) > 0 and len(C_B_final) > 0:
+#         d2 = np.sum((C_A_final[:,None,:] - C_B_final[None,:,:])**2, axis=2)
+#         nnB_of_A = np.argmin(d2, axis=1)
+#         nnA_of_B = np.argmin(d2, axis=0)
+#         for iA, jB in enumerate(nnB_of_A):
+#             if nnA_of_B[jB] == iA:
+#                 mnn_pairs.append((iA, jB))
 
+#     # rank and take top-1
+#     def _pair_score(iA, jB):
+#         a = phi_A_numeric_world(C_A_final[iA:iA+1])[0]
+#         b = phi_B_numeric_world(C_B_final[jB:jB+1])[0]
+#         dist = float(np.linalg.norm(C_A_final[iA] - C_B_final[jB]))
+#         return np.sqrt(a*a + b*b) + dist - (rA + rB)
 
-#     # Switch back to main recorder for differentiable ops
+#     C_A_top = np.zeros((0,3)); C_B_top = np.zeros((0,3)); top_pair = None
+#     if mnn_pairs:
+#         scores = np.array([_pair_score(iA, jB) for (iA, jB) in mnn_pairs], float)
+#         order  = np.argsort(scores)
+#         idx0   = int(order[0])
+#         top_pair = mnn_pairs[idx0]
+#         C_A_top = C_A_final[[top_pair[0]]]
+#         C_B_top = C_B_final[[top_pair[1]]]
+
+#     # restore main recorder for online KKT
 #     dummy.stop()
-#     recorder.start()
-    
-#     # ---- CSDL helpers for pose + φ_A in world ----
-#     def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
-#         qw, qx, qy, qz = q[0], q[1], q[2], q[3]
-#         r00 = 1.0 - 2.0*(qy*qy + qz*qz)
-#         r01 = 2.0*(qx*qy - qw*qz)
-#         r02 = 2.0*(qx*qz + qw*qy)
-#         r10 = 2.0*(qx*qy + qw*qz)
-#         r11 = 1.0 - 2.0*(qx*qx + qz*qz)
-#         r12 = 2.0*(qy*qz - qw*qx)
-#         r20 = 2.0*(qx*qz - qw*qy)
-#         r21 = 2.0*(qy*qz + qw*qx)
-#         r22 = 1.0 - 2.0*(qx*qx + qy*qy)
-#         R_flat = csdl.vstack((r00, r01, r02,
-#                               r10, r11, r12,
-#                               r20, r21, r22))
-#         return csdl.reshape(R_flat, (3, 3))
+#     if recorder is not None:
+#         recorder.start()
 
-#     def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
-#         R_wb_cs = quat_to_rm_csdl(quat_wxyz)
-#         R_bw_cs = csdl.transpose(R_wb_cs)
-#         rel  = p_w - pos_w_m                       # world m
-#         x_b_cm = 100.0 * csdl.matvec(R_bw_cs, rel) # body cm
-#         return phi_A_body_cm(x_b_cm) / 100.0       # meters
-
-#     # Conservative per-candidate metric: intersection(φ_A, φ_B)(c) − r_cell
-
-#     m_list = []
-#     for j in range(k):
-#         c = C_top[j]                         # (3,)
-#         a = phi_A_world_m(c)                 # scalar
-#         b = phi_B_world_m(c)                 # scalar
-#         diff = a - b                         # scalar
-#         m_j = csdl.sqrt(diff*diff) - r_cell
-#         m_list.append(csdl.reshape(m_j, (1,1)))  # (1,1)
-
-#     stack = csdl.vstack(tuple(m_list))           # (k,1)
-#     d_soft = csdl.minimum(csdl.reshape(stack, (k,)))  # scalar
-
-#     # -----------------------
-#     # Optional visualization (PyVista + Matplotlib)
-#     # -----------------------
-#     if plot:
+#     # optional OCTREE plotting
+#     if plot_octree:
 #         try:
 #             import pyvista as pv
-#             # Build a local grid around the remaining cells for context
-#             C = kept3d[max_refine]
-#             if len(C) == 0:
-#                 mins = np.array([[root_bounds[0], root_bounds[2], root_bounds[4]]])
-#                 maxs = np.array([[root_bounds[1], root_bounds[3], root_bounds[5]]])
-#             else:
+#             # bounds union helper
+#             def _cloud_bounds(C, h):
+#                 if len(C)==0: return None
+#                 hx, hy, hz = h
 #                 H = np.tile(np.array([hx, hy, hz], float), (len(C), 1))
 #                 mins = C - H; maxs = C + H
-#             xmin, ymin, zmin = mins.min(axis=0)
-#             xmax, ymax, zmax = maxs.max(axis=0)
+#                 return mins.min(axis=0), maxs.max(axis=0)
+
+#             bA = _cloud_bounds(keptA[max_refine], halfA[max_refine])
+#             bB = _cloud_bounds(keptB[max_refine], halfB[max_refine])
+#             if bA and bB:
+#                 mins = np.minimum(bA[0], bB[0]); maxs = np.maximum(bA[1], bB[1])
+#             elif bA: mins, maxs = bA
+#             elif bB: mins, maxs = bB
+#             else:
+#                 mins = np.array([rootA[0], rootA[2], rootA[4]])
+#                 maxs = np.array([rootA[1], rootA[3], rootA[5]])
 #             pad = 0.35
-#             xmin -= pad; ymin -= pad; zmin -= pad
-#             xmax += pad; ymax += pad; zmax += pad
+#             xmin, ymin, zmin = mins - pad; xmax, ymax, zmax = maxs + pad
 
 #             Nx = Ny = Nz = 96
 #             x = np.linspace(xmin, xmax, Nx)
@@ -798,12 +295,11 @@ def collision_check(
 #             z = np.linspace(zmin, zmax, Nz)
 #             X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
 #             P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-
 #             phiA = phi_A_numeric_world(P).reshape(X.shape)
 #             phiB = phi_B_numeric_world(P).reshape(X.shape)
 
 #             plotter = pv.Plotter()
-#             # φ_A isosurface
+#             # φA=0
 #             if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
 #                 gridA = pv.ImageData()
 #                 gridA.dimensions = np.array(phiA.shape)
@@ -812,8 +308,7 @@ def collision_check(
 #                 gridA.point_data["phiA"] = phiA.flatten(order="F")
 #                 contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
 #                 plotter.add_mesh(contA, color="royalblue", opacity=0.55)
-
-#             # φ_B isosurface
+#             # φB=0
 #             if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
 #                 gridB = pv.ImageData()
 #                 gridB.dimensions = np.array(phiB.shape)
@@ -823,52 +318,584 @@ def collision_check(
 #                 contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
 #                 plotter.add_mesh(contB, color="tomato", opacity=0.55)
 
-#             # Remaining voxel wireframes (downsampled)
-#             Cdraw = kept3d[max_refine]
+#             # wireframe voxels (no pair lines)
 #             MAX_DRAW = 1500
-#             step = max(1, len(Cdraw)//MAX_DRAW if len(Cdraw) else 1)
-#             for i in range(0, len(Cdraw), step):
-#                 cx, cy, cz = Cdraw[i]
+#             CdrawA = keptA[max_refine]; stepA = max(1, len(CdrawA)//MAX_DRAW if len(CdrawA) else 1)
+#             hxA, hyA, hzA = halfA[max_refine]
+#             for i in range(0, len(CdrawA), stepA):
+#                 cx, cy, cz = CdrawA[i]
 #                 cube = pv.Cube(center=(cx, cy, cz),
-#                                x_length=2*hx, y_length=2*hy, z_length=2*hz)
+#                                x_length=2*hxA, y_length=2*hyA, z_length=2*hzA)
 #                 plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
+
+#             CdrawB = keptB[max_refine]; stepB = max(1, len(CdrawB)//MAX_DRAW if len(CdrawB) else 1)
+#             hxB, hyB, hzB = halfB[max_refine]
+#             for i in range(0, len(CdrawB), stepB):
+#                 cx, cy, cz = CdrawB[i]
+#                 cube = pv.Cube(center=(cx, cy, cz),
+#                                x_length=2*hxB, y_length=2*hyB, z_length=2*hzB)
+#                 plotter.add_mesh(cube, style="wireframe", color="cyan", line_width=1.0, opacity=0.85)
 
 #             plotter.show_bounds(grid='front', location='outer', color='black',
 #                                 xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
-#             plotter.add_axes(); plotter.add_title("Pose / Remaining Cells")
+#             plotter.add_axes(); plotter.add_title("Two-Sided Broad-Phase: A(yellow) / B(cyan)")
+#             plotter.camera_position = 'iso'
 #             plotter.show()
 #         except Exception as e:
-#             print("[viz] skipped:", e)
+#             print("[octree viz] skipped:", e)
 
-#         # Matplotlib diagnostic plots (counts + φ_B bracket intervals)
+#         # level diagnostics
 #         try:
 #             import matplotlib.pyplot as plt
-#             order = sorted(kept3d.keys())
-#             counts = [len(kept3d[k]) for k in order]
-#             lows   = [intervals[k][0] for k in order]
-#             upps   = [intervals[k][1] for k in order]
-#             mids   = [0.5*(l+u) for l, u in zip(lows, upps)]
-
-#             figC, axC = plt.subplots(figsize=(6,4))
-#             axC.plot(order, counts, marker='o')
-#             axC.set_xticks(order); axC.set_xlabel("Refine level L")
-#             axC.set_ylabel("Voxels kept")
-#             axC.set_title(f"3D remaining voxels ({'Phase-1+2' if enable_phase2 else 'Phase-1 only'})")
-#             axC.grid(True, alpha=0.3)
-
-#             figI, axI = plt.subplots(figsize=(7,4))
-#             axI.plot(order, lows, marker='v', label='Lower bound')
-#             axI.plot(order, upps, marker='^', label='Upper bound')
-#             axI.plot(order, mids, marker='o', linestyle='--', label='Midpoint')
-#             axI.set_xticks(order)
-#             axI.set_xlabel("Refine level L"); axI.set_ylabel("Bracket on min φ_B (restricted)")
-#             axI.set_title("3D interval bounds over refinement levels")
-#             axI.grid(True, alpha=0.3); axI.legend()
+#             levels = sorted(keptA.keys())
+#             cntA = [len(keptA[L]) for L in levels]
+#             cntB = [len(keptB[L]) for L in levels]
+#             lowsA  = [intervalsA[L][0] for L in levels]
+#             uppsA  = [intervalsA[L][1] for L in levels]
+#             midsA  = [0.5*(l+u) for l,u in zip(lowsA, uppsA)]
+#             lowsB  = [intervalsB[L][0] for L in levels]
+#             uppsB  = [intervalsB[L][1] for L in levels]
+#             midsB  = [0.5*(l+u) for l,u in zip(lowsB, uppsB)]
+#             fig, axs = plt.subplots(1,3, figsize=(14,4))
+#             axs[0].plot(levels, cntA, marker='o', label='A kept')
+#             axs[0].plot(levels, cntB, marker='s', label='B kept')
+#             axs[0].set_xlabel("L"); axs[0].set_ylabel("# voxels kept"); axs[0].legend(); axs[0].grid(alpha=0.3)
+#             axs[1].plot(levels, lowsA, marker='v', label='A lower')
+#             axs[1].plot(levels, uppsA, marker='^', label='A upper')
+#             axs[1].plot(levels, midsA, marker='o', linestyle='--', label='A mid')
+#             axs[1].set_xlabel("L"); axs[1].set_ylabel("Bracket on min φ_B"); axs[1].legend(); axs[1].grid(alpha=0.3)
+#             axs[2].plot(levels, lowsB, marker='v', label='B lower')
+#             axs[2].plot(levels, uppsB, marker='^', label='B upper')
+#             axs[2].plot(levels, midsB, marker='o', linestyle='--', label='B mid')
+#             axs[2].set_xlabel("L"); axs[2].set_ylabel("Bracket on min φ_A"); axs[2].legend(); axs[2].grid(alpha=0.3)
+#             plt.suptitle(f"MNN pairs @final: {len(mnn_pairs)} (top-1 shown: {len(C_A_top)})")
 #             plt.show()
 #         except Exception as e:
-#             print("[plot] skipped:", e)
+#             print("[octree plots] skipped:", e)
 
-#     return d_soft
+#     # =============== ONLINE: penalized KKT (seeded by top-1 pair) =========================
+#     # CSDL SDFs in world (m)
+#     def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
+#         R_wb = quat_to_rm_csdl(quat_wxyz)
+#         R_bw = csdl.transpose(R_wb)
+#         if p_w.shape == (3,):
+#             rel_w  = p_w - pos_w_m
+#             x_b_cm = 100.0 * csdl.matvec(R_bw, rel_w)
+#             return phi_A_body_cm(x_b_cm) / 100.0
+#         K = p_w.shape[0]
+#         pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')
+#         rel_w  = p_w - pos_tiled
+#         x_b_cm = 100.0 * csdl.matmat(rel_w, csdl.transpose(R_bw))
+#         return phi_A_body_cm(x_b_cm) / 100.0
+
+#     # penalty KKT with independent seeds for a,b
+#     def penalty_kkt_pair(phi_A, phi_B, a0_np, b0_np, gamma=50.0, newton_tol=1e-8, name="penalty_kkt"):
+#         a = csdl.Variable(name=f"{name}:a", shape=(3,), value=a0_np)
+#         b = csdl.Variable(name=f"{name}:b", shape=(3,), value=b0_np)
+#         phiA = phi_A(a);  phiB = phi_B(b)
+#         gA = csdl.reshape(csdl.derivative(ofs=phiA, wrts=a), (3,))
+#         gB = csdl.reshape(csdl.derivative(ofs=phiB, wrts=b), (3,))
+#         R_a = (a - b) + gamma * phiA * gA
+#         R_b = (b - a) + gamma * phiB * gB
+#         solver = csdl.nonlinear_solvers.Newton(name, tolerance=newton_tol)
+#         solver.add_state(a, R_a, initial_value=a0_np)
+#         solver.add_state(b, R_b, initial_value=b0_np)
+#         solver.run()
+#         m = 0.5*(a+b)
+#         F_star = csdl.maximum(phi_A(m), phi_B(m), rho=20.0) - 0.05
+#         #diff = a - b
+#         #gap = csdl.sqrt(csdl.vdot(diff, diff) + _DEF_EPS)
+#         return m, F_star, a, b
+
+#     # choose seeds
+#     if len(C_A_top) == 1:
+#         a0 = C_A_top[0]; b0 = C_B_top[0]
+#         # print("Phi_A_top:", phi_A_numeric_world(a0)); print("Phi_B_top:", phi_B_numeric_world(b0));
+#         # print("Top-1 MNN pair:", a0, b0)
+#         # print("Midpoint C:", 0.5*(a0+b0))
+#         # --- pick gamma from seed balance ---
+#         a0 = C_A_top[0]; b0 = C_B_top[0]
+#         d0 = float(np.linalg.norm(a0 - b0))
+#         phiA0 = phi_A_numeric_world(a0)
+#         phiB0 = phi_B_numeric_world(b0)
+#         phi_bar = max(1e-4, 0.5*(abs(phiA0) + abs(phiB0)))   # guard
+#         gamma_bal = np.clip(d0 / phi_bar, 5.0, 300.0)        # seed-balanced gamma
+
+#         m, F_star, a, b = penalty_kkt_pair(phi_A_world_m, phi_B_world_m,
+#                                                     a0, b0,
+#                                                     gamma=gamma_bal, newton_tol=newton_tol,
+#                                                     name="collision_kkt_gbal")
+#         # # --- (optional) two-stage continuation for robustness ---
+#         # gammas = [0.5*gamma_bal, gamma_bal, 0.5*(gamma_bal+gamma), gamma]  # last is your target (e.g., 50)
+#         # a_init, b_init = a0, b0
+#         # for g in gammas:
+#         #     m, F_star, a, b, pair_gap = penalty_kkt_pair(phi_A_world_m, phi_B_world_m,
+#         #                                                 a_init, b_init,
+#         #                                                 gamma=g, newton_tol=newton_tol,
+#         #                                                 name=f"collision_kkt_g{g:.1f}")
+#         #     # warm start next stage
+#         #     a_init = np.asarray(a.value).reshape(3)
+#         #     b_init = np.asarray(b.value).reshape(3)
+
+#     else:
+#         # fallback: midpoint between drone and gate center if no pairs
+#         mid = 0.5*(p_w + b_seed)
+#         print("Midpoint fallback:", mid)
+#         m, F_star, a, b = penalty_kkt_pair(phi_A_world_m, phi_B_world_m, mid, mid,
+#                                                      gamma=gamma, newton_tol=newton_tol, name="collision_kkt_fallback")
+
+#     # optional KKT plotting
+#     if plot_kkt:
+#         try:
+#             import pyvista as pv
+#             # quick grids (drone tight; gate broader)
+#             pos_np = np.asarray(pos_w_m.value)
+#             d_half = 0.22
+#             bounds_drone = ((pos_np[0]-d_half, pos_np[0]+d_half),
+#                             (pos_np[1]-d_half, pos_np[1]+d_half),
+#                             (pos_np[2]-d_half, pos_np[2]+d_half))
+#             g_half = np.array([1.0, 1.5, 1.5])  # rough sphere/box max with margin
+#             gcen  = b_seed
+#             bounds_gate = ((gcen[0]-g_half[0], gcen[0]+g_half[0]),
+#                            (gcen[1]-g_half[1], gcen[1]+g_half[1]),
+#                            (gcen[2]-g_half[2], gcen[2]+g_half[2]))
+#             def contour_zero(phi_fn, bounds, dx, scal_name):
+#                 if not hasattr(pv, "ImageData"): raise RuntimeError("PyVista ImageData missing")
+#                 (xmin,xmax),(ymin,ymax),(zmin,zmax) = bounds
+#                 nx = int(np.floor((xmax-xmin)/dx))+1
+#                 ny = int(np.floor((ymax-ymin)/dx))+1
+#                 nz = int(np.floor((zmax-zmin)/dx))+1
+#                 grid = pv.ImageData()
+#                 grid.dimensions = (nx,ny,nz); grid.origin=(xmin,ymin,zmin); grid.spacing=(dx,dx,dx)
+#                 P = np.asarray(grid.points)
+#                 vals = phi_fn(csdl.Variable(value=P.astype(float))).value.reshape(-1)
+#                 grid[scal_name] = vals
+#                 return grid.contour(isosurfaces=[0.0], scalars=scal_name)
+
+#             surf_A = contour_zero(phi_A_world_m, bounds_drone, 0.01, "phiA")
+#             surf_B = contour_zero(phi_B_world_m, bounds_gate,  0.04, "phiB")
+
+#             a_np = np.asarray(a.value).reshape(3)
+#             b_np = np.asarray(b.value).reshape(3)
+#             m_np = np.asarray(m.value).reshape(3)
+#             s_a = pv.Sphere(radius=0.010, center=a_np)
+#             s_b = pv.Sphere(radius=0.010, center=b_np)
+#             s_m = pv.Sphere(radius=0.008, center=m_np)
+
+#             p = pv.Plotter()
+#             p.add_mesh(surf_A, color="#1f77b4", opacity=0.75, smooth_shading=True, label="Drone (A=0)")
+#             p.add_mesh(surf_B, color="#f46c6c", opacity=0.35, smooth_shading=True, label="Gate (B=0)")
+#             p.add_mesh(s_a, color="#bc2525"); p.add_mesh(s_b, color="#9467bd"); p.add_mesh(s_m, color="#ffdd57")
+#             p.add_axes(line_width=2); p.add_legend(bcolor="black", border=True)
+#             p.set_background("black", top="dimgray"); p.camera_position="iso"
+#             p.show(title="Penalty KKT: φA=0, φB=0, witnesses a/b, midpoint m")
+#         except Exception as e:
+#             print("[kkt viz] skipped:", e)
+
+#     # return dict(
+#     #     keptA=keptA, halfA=halfA, intervalsA=intervalsA,
+#     #     keptB=keptB, halfB=halfB, intervalsB=intervalsB,
+#     #     mnn_pairs=mnn_pairs, C_A_top=C_A_top, C_B_top=C_B_top,
+#     #     m=m, F_star=F_star, a=a, b=b, pair_gap=pair_gap
+#     # )
+#     return m, F_star, a, b
+
+
+# =============== END HYBRID METHOD ===============
+
+
+def collision_check(
+    phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
+    phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
+    pos_w_m: csdl.Variable,
+    quat_wxyz: csdl.Variable,
+    recorder: csdl.Recorder = None,
+    *,
+    max_refine: int = 8,
+    enable_phase2: bool = True,
+    K: int = 5,
+    plot: bool = False,
+) -> Tuple[Dict[int, np.ndarray], Dict[int, Tuple[float, float, float]], csdl.Variable, csdl.Variable, np.ndarray]:
+    """
+    Octree broad-phase + (small) differentiable narrow-phase aggregator for two SDFs.
+
+    Assumptions
+    ----------
+    • phi_A_body_cm : evaluates points given in DRONE BODY frame **centimeters** (returns cm)
+    • phi_B_world_m : evaluates points given in WORLD frame **meters** (returns m)
+    • The drone pose (pos, quat) maps WORLD→BODY; we convert WORLD meters to BODY cm for φ_A.
+
+    Parameters
+    ----------
+    phi_A_body_cm : Callable[[csdl.Variable], csdl.Variable]
+        CSDL SDF for object A (drone) in body/cm.
+    phi_B_world_m : Callable[[csdl.Variable], csdl.Variable]
+        CSDL SDF for object/obstacle B in world/m.
+    pos_w_m : csdl.Variable (shape (3,))
+        Drone position in world coordinates (meters).
+    quat_wxyz : csdl.Variable (shape (4,))
+        World-from-body quaternion in (w,x,y,z) order.
+    max_refine : int, default 8
+        Octree depth (number of refinement iterations).
+    enable_phase2 : bool, default True
+        If True, apply extra culling using φ_B at voxel centers.
+    K : int, default 5
+        Number of top candidate voxels to feed the differentiable aggregator.
+    plot : bool, default False
+        If True, produce PyVista/Matplotlib visualizations.
+
+    Returns
+    -------
+    kept3d : dict[int, (N_L,3) np.ndarray]
+        Per refinement level L ∈ {0..max_refine}, voxel centers kept (WORLD, m).
+    halfsizes : dict[int, (hx,hy,hz)]
+        Per level voxel half-sizes (WORLD, m).
+    d_soft : csdl.Variable (scalar)
+        Differentiable conservative distance-like metric (soft-min over K candidates).
+    stack : csdl.Variable (K, 1)
+        The per-candidate conservative intersection values before soft-min.
+    C_top : (K,3) np.ndarray
+        WORLD (m) coordinates of the K candidates used in the differentiable stage.
+    """
+
+    # -----------------------
+    # Helpers (NumPy path)
+    # -----------------------
+    def _as_array(x, shape):
+        return np.asarray(getattr(x, 'value', x), float).reshape(shape)
+
+    def _quat_to_R_wb(q):
+        """Rotation matrix (WORLD ← BODY) from quaternion (w,x,y,z)."""
+        w, x, y, z = q
+        n = np.linalg.norm(q)
+        if n == 0:
+            return np.eye(3)
+        w, x, y, z = q / n
+        return np.array([
+            [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
+        ])
+
+    p_w  = _as_array(pos_w_m, (3,))
+    R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
+
+    def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+        P_b_m  = (P_w_m - p_w) @ R_wb.T        # world→body (meters)
+        P_b_cm = 100.0 * P_b_m                 # meters→centimeters
+        vals_cm = phi_A_body_cm(P_b_cm).value  # cm
+        return 0.01 * np.asarray(vals_cm).reshape(-1)  # meters
+
+    def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+        vals = phi_B_world_m(P_w_m).value
+        return np.asarray(vals).reshape(-1)
+
+    # Freeze current recorder for broad-phase, use dummy recorder for now
+    recorder.stop()
+    dummy = csdl.Recorder(inline=True)
+    dummy.start()
+
+    # -----------------------
+    # Voxel structure
+    # -----------------------
+    class Voxels:
+        def __init__(self, nodes: np.ndarray, L: int, bounds: Tuple[float, float, float, float, float, float]):
+            self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+            self.L = int(L)
+            self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
+
+        @classmethod
+        def root(cls, bounds):
+            return cls(nodes=np.array([[0,0,0]], dtype=np.int64), L=0, bounds=bounds)
+
+        def _sizes(self):
+            W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
+            n = 1 << self.L
+            dx, dy, dz = W/n, H/n, D/n
+            hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
+            return dx, dy, dz, hx, hy, hz
+
+        def centers(self) -> np.ndarray:
+            dx, dy, dz, _, _, _ = self._sizes()
+            i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
+            cx = self.xmin + (i + 0.5) * dx
+            cy = self.ymin + (j + 0.5) * dy
+            cz = self.zmin + (k + 0.5) * dz
+            return np.column_stack([cx, cy, cz])
+
+        def half_sizes(self) -> Tuple[float, float, float]:
+            _, _, _, hx, hy, hz = self._sizes()
+            return float(hx), float(hy), float(hz)
+
+        def radius(self) -> float:
+            hx, hy, hz = self.half_sizes()
+            return float(np.sqrt(hx*hx + hy*hy + hz*hz))
+
+        def subdivide(self):
+            i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
+            kids = np.array([
+                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|0), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|1), axis=1),
+                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
+            ]).reshape(-1, 3)
+            return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
+
+        def restrict(self, mask: np.ndarray):
+            self.nodes = self.nodes[np.asarray(mask, bool)]
+
+    # -----------------------
+    # Auto-size root bounds by probing φ_A in world space
+    # -----------------------
+    def _autosize_root_bbox() -> Tuple[float, float, float, float, float, float]:
+        dirs = []
+        s = 1/np.sqrt(2); t = 1/np.sqrt(3)
+        axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
+        edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],
+                 [+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
+                 [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
+        corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],
+                   [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
+        for d in axes + edges + corners:
+            v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
+        radii = np.linspace(0.05, 0.80, 32)  # meters
+        max_hit = 0.25; margin = 0.05
+        for d in dirs:
+            phis = [phi_A_numeric_world([p_w + r*d])[0] for r in radii]
+            phis = np.asarray(phis)
+            if (phis > 0.01).any():
+                idx = np.argmax(phis > 0.01)
+                hit_r = radii[min(idx+1, len(radii)-1)]
+            else:
+                hit_r = radii[-1]
+            max_hit = max(max_hit, float(hit_r))
+        half = max_hit + margin
+        return (p_w[0]-half, p_w[0]+half, p_w[1]-half, p_w[1]+half, p_w[2]-half, p_w[2]+half)
+
+    root_bounds = _autosize_root_bbox()
+
+    # -----------------------
+    # One refinement step
+    # -----------------------
+    def _refine_once(vox: "Voxels"):
+        vox = vox.subdivide()
+        r   = vox.radius()
+        C   = vox.centers()
+        keep1 = (phi_A_numeric_world(C) <= r)     # Phase-1 on φ_A
+        vox.restrict(keep1)
+
+        interval = (np.nan, np.nan)
+        if enable_phase2 and len(vox.nodes) > 0:
+            C2 = vox.centers()
+            phiB = phi_B_numeric_world(C2)
+            min_u = np.min(phiB) + r
+            keep2 = (phiB <= (min_u + r))         # Phase-2 on φ_B
+            vox.restrict(keep2)
+            interval = (min_u - 2.0*r, min_u)
+        return vox, interval
+
+    # -----------------------
+    # Run refinement
+    # -----------------------
+    vox = Voxels.root(root_bounds)
+    kept3d     = {0: vox.centers().copy()}
+    intervals  = {0: (np.nan, np.nan)}
+    halfsizes  = {0: vox.half_sizes()}
+
+    for L in range(max_refine):
+        vox, inter = _refine_once(vox)
+        kept3d[L+1]    = vox.centers().copy()
+        intervals[L+1] = inter
+        halfsizes[L+1] = vox.half_sizes()
+
+    # -----------------------
+    # Setup for online phase
+    # -----------------------
+    C_final = kept3d[max_refine]
+
+    hx, hy, hz = halfsizes[max_refine]
+    r_cell = float(np.linalg.norm([hx, hy, hz]))  # half-diagonal of voxels at final level
+
+    # Rank candidates by conservative score φ_B(center) - r_cell
+    phiB_centers = phi_B_numeric_world(C_final)
+    scores = phiB_centers - r_cell
+    order  = np.argsort(scores)
+    k = int(min(K, len(order)))
+    C_top = C_final[order[:k]]
+
+
+    # --- NEW: store candidates in A's body frame (constants for the online phase) ---
+    p_w_np  = np.asarray(pos_w_m.value, float)                   # offline pose used above
+    q_wxyz  = np.asarray(quat_wxyz.value, float)
+    R_wb_np = _quat_to_R_wb(q_wxyz)                              # you already have this helper
+    R_bw_np = R_wb_np.T
+    C_b_m   = (C_top - p_w_np[None, :]) @ R_bw_np.T              # (K,3) body meters
+    C_b_cm  = 100.0 * C_b_m                                      # (K,3) body cm for φ_A
+    
+    # Switch back to main recorder for differentiable ops
+    dummy.stop()
+    recorder.start()
+    
+    # ---- CSDL helpers for pose + φ_A in world ----
+    def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
+        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+        r00 = 1.0 - 2.0*(qy*qy + qz*qz)
+        r01 = 2.0*(qx*qy - qw*qz)
+        r02 = 2.0*(qx*qz + qw*qy)
+        r10 = 2.0*(qx*qy + qw*qz)
+        r11 = 1.0 - 2.0*(qx*qx + qz*qz)
+        r12 = 2.0*(qy*qz - qw*qx)
+        r20 = 2.0*(qx*qz - qw*qy)
+        r21 = 2.0*(qy*qz + qw*qx)
+        r22 = 1.0 - 2.0*(qx*qx + qy*qy)
+        R_flat = csdl.vstack((r00, r01, r02,
+                              r10, r11, r12,
+                              r20, r21, r22))
+        return csdl.reshape(R_flat, (3, 3))
+
+    def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
+        R_wb_cs = quat_to_rm_csdl(quat_wxyz)
+        R_bw_cs = csdl.transpose(R_wb_cs)
+        if p_w.shape == (3,):
+            rel = p_w - pos_w_m
+            x_b_cm = 100.0 * csdl.matvec(R_bw_cs, rel)      # (3,)
+            return phi_A_body_cm(x_b_cm) / 100.0            # scalar
+        else:
+            K = p_w.shape[0]
+            pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')
+            rel = p_w - pos_tiled                           # (K,3)
+            x_b_cm = 100.0 * csdl.matmat(rel, R_bw_cs)      # (K,3)
+            return phi_A_body_cm(x_b_cm) / 100.0            # (K,)
+
+
+    # ---- Pose-tied candidate positions (world) from body-frame constants ----
+    C_b_cm_cs = csdl.Variable(value=C_b_cm)          # (K,3) constants
+    C_b_m_cs  = C_b_cm_cs / 100.0                    # (K,3)
+    R_wb_cs   = quat_to_rm_csdl(quat_wxyz)           # WORLD←BODY (live)
+    # C_b_m_cs: (K,3), R_wb_cs: (3,3)
+    C_rot   = csdl.matmat(C_b_m_cs, csdl.transpose(R_wb_cs))  # (K,3)
+
+    K = C_b_m_cs.shape[0]  # e.g., 5
+    pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')  # (K,3)
+
+    C_w_cs = pos_tiled + C_rot  # (K,3)
+
+
+    # ---- Evaluate at those world points; BOTH φ_A and φ_B are used ----
+    # (φ_A_world_m can take batched (K,3); if not, loop—shape stays (K,))
+    #phiA_K = phi_A_world_m(C_w_cs)                   # (K,) -> carries SHAPE sensitivities
+    phiB_K = phi_B_world_m(C_w_cs)                   # (K,) -> carries POSE sensitivities
+
+    # Recommended: soft intersection at each candidate, then conservative inflation
+
+    F_K   = csdl.maximum(phiB_K) - 0.15                    # (K,)
+    m_K   = F_K - r_cell                                         # conservative
+    d_soft = csdl.minimum(m_K)                                   # KS-min over K
+
+
+    # -----------------------
+    # Optional visualization (PyVista + Matplotlib)
+    # -----------------------
+    if plot:
+        try:
+            import pyvista as pv
+            # Build a local grid around the remaining cells for context
+            C = kept3d[max_refine]
+            if len(C) == 0:
+                mins = np.array([[root_bounds[0], root_bounds[2], root_bounds[4]]])
+                maxs = np.array([[root_bounds[1], root_bounds[3], root_bounds[5]]])
+            else:
+                H = np.tile(np.array([hx, hy, hz], float), (len(C), 1))
+                mins = C - H; maxs = C + H
+            xmin, ymin, zmin = mins.min(axis=0)
+            xmax, ymax, zmax = maxs.max(axis=0)
+            pad = 0.35
+            xmin -= pad; ymin -= pad; zmin -= pad
+            xmax += pad; ymax += pad; zmax += pad
+
+            Nx = Ny = Nz = 96
+            x = np.linspace(xmin, xmax, Nx)
+            y = np.linspace(ymin, ymax, Ny)
+            z = np.linspace(zmin, zmax, Nz)
+            X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+            P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+            phiA = phi_A_numeric_world(P).reshape(X.shape)
+            phiB = phi_B_numeric_world(P).reshape(X.shape)
+
+            plotter = pv.Plotter()
+            # φ_A isosurface
+            if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
+                gridA = pv.ImageData()
+                gridA.dimensions = np.array(phiA.shape)
+                gridA.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+                gridA.origin    = (x[0], y[0], z[0])
+                gridA.point_data["phiA"] = phiA.flatten(order="F")
+                contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
+                plotter.add_mesh(contA, color="royalblue", opacity=0.55)
+
+            # φ_B isosurface
+            if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
+                gridB = pv.ImageData()
+                gridB.dimensions = np.array(phiB.shape)
+                gridB.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+                gridB.origin    = (x[0], y[0], z[0])
+                gridB.point_data["phiB"] = phiB.flatten(order="F")
+                contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
+                plotter.add_mesh(contB, color="tomato", opacity=0.55)
+
+            # Remaining voxel wireframes (downsampled)
+            Cdraw = kept3d[max_refine]
+            MAX_DRAW = 1500
+            step = max(1, len(Cdraw)//MAX_DRAW if len(Cdraw) else 1)
+            for i in range(0, len(Cdraw), step):
+                cx, cy, cz = Cdraw[i]
+                cube = pv.Cube(center=(cx, cy, cz),
+                               x_length=2*hx, y_length=2*hy, z_length=2*hz)
+                plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
+
+            plotter.show_bounds(grid='front', location='outer', color='black',
+                                xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
+            plotter.add_axes(); plotter.add_title("Pose / Remaining Cells")
+            plotter.show()
+        except Exception as e:
+            print("[viz] skipped:", e)
+
+        # Matplotlib diagnostic plots (counts + φ_B bracket intervals)
+        try:
+            import matplotlib.pyplot as plt
+            order = sorted(kept3d.keys())
+            counts = [len(kept3d[k]) for k in order]
+            lows   = [intervals[k][0] for k in order]
+            upps   = [intervals[k][1] for k in order]
+            mids   = [0.5*(l+u) for l, u in zip(lows, upps)]
+
+            figC, axC = plt.subplots(figsize=(6,4))
+            axC.plot(order, counts, marker='o')
+            axC.set_xticks(order); axC.set_xlabel("Refine level L")
+            axC.set_ylabel("Voxels kept")
+            axC.set_title(f"3D remaining voxels ({'Phase-1+2' if enable_phase2 else 'Phase-1 only'})")
+            axC.grid(True, alpha=0.3)
+
+            figI, axI = plt.subplots(figsize=(7,4))
+            axI.plot(order, lows, marker='v', label='Lower bound')
+            axI.plot(order, upps, marker='^', label='Upper bound')
+            axI.plot(order, mids, marker='o', linestyle='--', label='Midpoint')
+            axI.set_xticks(order)
+            axI.set_xlabel("Refine level L"); axI.set_ylabel("Bracket on min φ_B (restricted)")
+            axI.set_title("3D interval bounds over refinement levels")
+            axI.grid(True, alpha=0.3); axI.legend()
+            plt.show()
+        except Exception as e:
+            print("[plot] skipped:", e)
+
+    return d_soft
 
 
 
