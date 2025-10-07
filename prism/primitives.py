@@ -136,3 +136,98 @@ def sdf_capsule(p1, p2, radius):
         return d
 
     return _sdf
+
+
+# ================= Numpy Versions for Explicit Op =================#
+_EPS = 1e-12
+
+# primitives_np.py
+import numpy as np
+from scipy.spatial.transform import Rotation as SciRot
+
+def sdf_box_np(center, half_size, rotation_angles=(0.0, 0.0, 0.0), *, degrees=True, order='xyz'):
+    """
+    Oriented box SDF (NumPy) using SciPy Rotation.
+    center, half_size: (3,)
+    rotation_angles: Euler angles in `order` (deg if degrees=True).
+    """
+    c = np.asarray(center, float).reshape(3)
+    h = np.asarray(half_size, float).reshape(3)
+
+    # SciPy rotation → 3x3 matrix; same semantics as your CSDL path
+    Rm = SciRot.from_euler(order, rotation_angles, degrees=degrees).as_matrix()
+    RT = Rm.T  # world -> box frame
+
+    def _sdf(P):
+        P = np.asarray(P, float)
+        if P.ndim == 1:
+            p_loc = (P - c) @ RT
+            q = np.abs(p_loc) - h
+            q_clip = np.maximum(q, 0.0)
+            outside = np.linalg.norm(q_clip)
+            inside  = np.minimum(np.max(q), 0.0)
+            return outside + inside
+        else:
+            p_loc = (P - c[None, :]) @ RT
+            q = np.abs(p_loc) - h[None, :]
+            q_clip = np.maximum(q, 0.0)
+            outside = np.linalg.norm(q_clip, axis=-1)
+            inside  = np.minimum(np.max(q, axis=-1), 0.0)
+            return outside + inside
+
+    return _sdf
+
+
+def sdf_sphere_np(center, radius):
+    """
+    Sphere SDF (NumPy).
+    center: (3,), radius: float
+    """
+    c = np.asarray(center, float).reshape(3)
+    r = float(radius)
+    def _sdf(P):
+        P = np.asarray(P, float)
+        if P.ndim == 1:
+            return np.linalg.norm(P - c) - r
+        else:
+            return np.linalg.norm(P - c[None, :], axis=-1) - r
+    return _sdf
+
+def sdf_plane_np(p0, normal):
+    """
+    Plane SDF (NumPy): signed distance; positive on the normal side.
+    """
+    p0 = np.asarray(p0, float).reshape(3)
+    n  = np.asarray(normal, float).reshape(3)
+    n  = n / (np.linalg.norm(n) + _EPS)
+
+    def _sdf(P):
+        P = np.asarray(P, float)
+        if P.ndim == 1:
+            return np.dot(P - p0, n)
+        else:
+            return (P - p0[None, :]) @ n
+    return _sdf
+
+def sdf_capsule_np(p1, p2, radius):
+    """
+    Capsule SDF (NumPy): segment [p1,p2] with radius.
+    """
+    a = np.asarray(p1, float).reshape(3)
+    b = np.asarray(p2, float).reshape(3)
+    r = float(radius)
+    ab = b - a
+    denom = np.dot(ab, ab) + _EPS
+
+    def _sdf(P):
+        P = np.asarray(P, float)
+        if P.ndim == 1:
+            t = np.clip(np.dot(P - a, ab) / denom, 0.0, 1.0)
+            closest = a + t * ab
+            return np.linalg.norm(P - closest) - r
+        else:
+            ap = P - a[None, :]
+            t = np.clip((ap @ ab) / denom, 0.0, 1.0)           # (N,)
+            closest = a[None, :] + t[:, None] * ab[None, :]    # (N,3)
+            return np.linalg.norm(P - closest, axis=-1) - r
+    return _sdf

@@ -1,19 +1,574 @@
 
-# from typing import Callable, Dict, Tuple, Union
-# import numpy as np
-# import csdl_alpha as csdl
-# from prism import operations as op
-
-
-
-# ================ HYBRID METHOD ================
 from typing import Callable, Dict, Tuple, List, Optional, Union
 import numpy as np
 import csdl_alpha as csdl
 
-# # ---------- helpers shared by both phases ----------
+class BroadphaseOp(csdl.CustomExplicitOperation):
+    def __init__(self, A_np_fn, B_np_fn=None, *, K=8, max_refine=8,
+                 enable_phase2=False, expects_A_params=False):
+        super().__init__()
+        self.A_np_fn = A_np_fn              # e.g. drone_phi_np
+        self.B_np_fn = B_np_fn              # optional numeric φ_B
+        self.K = int(K); self.max_refine = int(max_refine)
+        self.enable_phase2 = bool(enable_phase2 and (B_np_fn is not None))
+        self.expects_A_params = bool(expects_A_params)
+
+    def evaluate(self, inputs):
+        self.declare_input('pos_w_m',   inputs.pos_w_m)
+        self.declare_input('quat_wxyz', inputs.quat_wxyz)
+
+        # Only declare geometry inputs if you want the op to read DVs for A:
+        if self.expects_A_params:
+            self.declare_input('body_center_cm',   inputs.body_center_cm)
+            self.declare_input('body_half_cm',     inputs.body_half_cm)
+            self.declare_input('body_angles_deg',  inputs.body_angles_deg)
+            self.declare_input('arm_radius_cm',    inputs.arm_radius_cm)
+            self.declare_input('arm_ends_cm',      inputs.arm_ends_cm)       # (N_arm,3)
+            self.declare_input('rotor_centers_cm', inputs.rotor_centers_cm)  # (N_rot,3)
+            self.declare_input('rotor_bottoms_cm', inputs.rotor_bottoms_cm)  # (N_rot,3)
+            self.declare_input('rotor_radii_cm',   inputs.rotor_radii_cm)    # (N_rot,)
+
+        C_b_cm = self.create_output('C_b_cm', (self.K, 3))
+        r_cell = self.create_output('r_cell', (1,))
+        return csdl.VariableGroup(C_b_cm=C_b_cm, r_cell=r_cell)
+    
+    # --- pure NumPy compute ---
+    @staticmethod
+    def _quat_to_R_wb(q):  # WORLD <- BODY (w,x,y,z)
+        w,x,y,z = q; n = np.linalg.norm(q); 
+        if n == 0: return np.eye(3)
+        w,x,y,z = q/n
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+            [2*(x*y+w*z),   1-2*(x*x+z*z), 2*(y*z-w*x)],
+            [2*(x*z-w*y),   2*(y*z+w*x),   1-2*(x*x+y*y)]
+        ], float)
+
+    def compute(self, inp, out):
+        # pose (numbers)
+        p_w  = np.asarray(inp['pos_w_m'],   float).reshape(3)
+        q    = np.asarray(inp['quat_wxyz'], float).reshape(4)
+        R_wb = self._quat_to_R_wb(q); R_bw = R_wb.T
+
+        # Build φ_A in WORLD meters (calls your drone_phi_np)
+        if self.expects_A_params:
+            A = dict(
+                body_center   = np.asarray(inp['body_center_cm'],   float),
+                body_half     = np.asarray(inp['body_half_cm'],     float),
+                body_angles   = np.asarray(inp['body_angles_deg'],  float),
+                arm_radius    = float(np.asarray(inp['arm_radius_cm'], float)),
+                arm_endpoints = np.asarray(inp['arm_ends_cm'],      float).reshape(-1,3).tolist(),
+                rotor_centers = np.asarray(inp['rotor_centers_cm'], float).reshape(-1,3).tolist(),
+                rotor_bottoms = np.asarray(inp['rotor_bottoms_cm'], float).reshape(-1,3).tolist(),
+                rotor_radius  = np.asarray(inp['rotor_radii_cm'],   float).reshape(-1),
+            )
+            def phi_A_body_cm_np(P_b_cm):
+                return self.A_np_fn(P_b_cm, params=A)   # ← with params
+        else:
+            def phi_A_body_cm_np(P_b_cm):
+                return self.A_np_fn(P_b_cm)            # ← no params
+
+        def phi_A_world_m_np(P_w_m):
+            Pw = np.asarray(P_w_m, float).reshape(-1,3)
+            Pb_m  = (Pw - p_w) @ R_wb.T
+            Pb_cm = 100.0 * Pb_m
+            return 0.01 * phi_A_body_cm_np(Pb_cm)
+        
+        phi_B_world_m_np = self.B_np_fn  # may be None
+
+        # --- autosize root bbox around A by probing φ_A in WORLD m ---
+        def autosize_root_bbox():
+            dirs = []
+            s = 1/np.sqrt(2); t = 1/np.sqrt(3)
+            axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
+            edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],[+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
+                     [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
+            corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],[-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
+            for d in axes+edges+corners:
+                v = np.asarray(d,float); v /= np.linalg.norm(v); dirs.append(v)
+            radii = np.linspace(0.05, 0.80, 32)  # m
+            max_hit, margin = 0.25, 0.05
+            for d in dirs:
+                P = p_w[None,:] + radii[:,None]*d[None,:]
+                ph = phi_A_world_m_np(P)
+                idx = np.argmax(ph > 0.01) if (ph > 0.01).any() else (len(radii)-1)
+                hit_r = radii[min(idx+1, len(radii)-1)]
+                max_hit = max(max_hit, float(hit_r))
+            half = max_hit + margin
+            return (p_w[0]-half,p_w[0]+half,p_w[1]-half,p_w[1]+half,p_w[2]-half,p_w[2]+half)
+
+        # voxel structure (NumPy-only)
+        class Vox:
+            def __init__(self, nodes, L, b):
+                self.nodes=np.asarray(nodes,np.int64).reshape(-1,3); self.L=int(L)
+                self.xmin,self.xmax,self.ymin,self.ymax,self.zmin,self.zmax = map(float,b)
+            @classmethod
+            def root(cls,b): return cls(np.array([[0,0,0]],np.int64),0,b)
+            def _sizes(self):
+                W=self.xmax-self.xmin; H=self.ymax-self.ymin; D=self.zmax-self.zmin; n=1<<self.L
+                dx,dy,dz=W/n,H/n,D/n; return dx,dy,dz,0.5*dx,0.5*dy,0.5*dz
+            def centers(self):
+                dx,dy,dz,_,_,_=self._sizes(); ijk=self.nodes.astype(float)
+                cx=self.xmin+(ijk[:,0]+0.5)*dx; cy=self.ymin+(ijk[:,1]+0.5)*dy; cz=self.zmin+(ijk[:,2]+0.5)*dz
+                return np.column_stack([cx,cy,cz]).astype(np.float32,copy=False)
+            def half_sizes(self): _,_,_,hx,hy,hz=self._sizes(); return float(hx),float(hy),float(hz)
+            def radius(self): hx,hy,hz=self.half_sizes(); return float(np.linalg.norm([hx,hy,hz]))
+            def subdivide(self):
+                i,j,k=self.nodes[:,0],self.nodes[:,1],self.nodes[:,2]
+                kids=np.array([np.stack(((i<<1)|a,(j<<1)|b,(k<<1)|c),1)
+                               for a in (0,1) for b in (0,1) for c in (0,1)]).reshape(-1,3)
+                return Vox(kids,self.L+1,(self.xmin,self.xmax,self.ymin,self.ymax,self.zmin,self.zmax))
+            def restrict(self,mask): self.nodes=self.nodes[np.asarray(mask,bool)]
+
+        # refine
+        vox = Vox.root(autosize_root_bbox())
+        for _ in range(self.max_refine):
+            vox = vox.subdivide()
+            r   = vox.radius()
+            C   = vox.centers()
+            keep1 = (phi_A_world_m_np(C) <= r)     # Phase-1 using A
+            vox.restrict(keep1)
+            if self.enable_phase2 and len(vox.nodes)>0:
+                C2 = vox.centers()
+                phiB = phi_B_world_m_np(C2)
+                min_u = np.min(phiB) + r
+                keep2 = (phiB <= (min_u + r))
+                vox.restrict(keep2)
+
+        C_final = vox.centers()
+        hx,hy,hz = vox.half_sizes()
+        r_cell = float(np.linalg.norm([hx,hy,hz]))  # m
+
+        if len(C_final)==0:
+            C_top = np.zeros((self.K,3), float)
+        else:
+            # rank: use φ_B if available, else φ_A
+            scores = (phi_B_world_m_np(C_final) if self.enable_phase2 else phi_A_world_m_np(C_final)) - r_cell
+            order  = np.argsort(scores); k = min(self.K, len(order))
+            C_top  = C_final[order[:k]]
+            if k < self.K:
+                pad = C_top[-1:] if k>0 else np.zeros((1,3),float)
+                C_top = np.vstack([C_top, np.repeat(pad, self.K-k, axis=0)])
+
+        # return BODY-frame cm candidates (constants for narrow-phase)
+        C_b_m  = (C_top - p_w[None,:]) @ R_bw.T
+        out['C_b_cm'] = (100.0 * C_b_m).astype(float)   # (K,3), cm
+        out['r_cell'] = np.array([r_cell], float)       # (1,), m
+
+    def compute_derivatives(self, *_): pass  # non-smooth selection
+
+
+def collision_check(
+    phi_A_body_cm_np,           # your drone_sdf_np (NumPy; BODY cm)
+    phi_B_world_m,              # CSDL evaluator (WORLD m)
+    pos_w_m, quat_wxyz,         # CSDL vars
+    *, K=5, max_refine=8, enable_phase2=False, phi_B_world_m_np=None
+):
+    # Feed pose into the op; (no A params here since your drone_sdf_np is constant for now)
+    inputs = csdl.VariableGroup()
+    inputs.pos_w_m, inputs.quat_wxyz = pos_w_m, quat_wxyz
+
+    op = BroadphaseOp(
+    A_np_fn=phi_A_body_cm_np,
+    B_np_fn=phi_B_world_m_np,
+    K=K, max_refine=max_refine, enable_phase2=enable_phase2
+    )
+    outs = op.evaluate(inputs)
+    C_b_cm, r_cell = outs.C_b_cm, outs.r_cell[0]   # (K,3), scalar
+
+    # Narrow phase (differentiable wrt pose; same as you had)
+    def quat_to_R(q):
+        qw,qx,qy,qz = q[0],q[1],q[2],q[3]
+        r00 = 1-2*(qy*qy+qz*qz); r01 = 2*(qx*qy-qw*qz); r02 = 2*(qx*qz+qw*qy)
+        r10 = 2*(qx*qy+qw*qz);   r11 = 1-2*(qx*qx+qz*qz); r12 = 2*(qy*qz-qw*qx)
+        r20 = 2*(qx*qz-qw*qy);   r21 = 2*(qy*qz+qw*qx);   r22 = 1-2*(qx*qx+qy*qy)
+        return csdl.reshape(csdl.vstack((r00,r01,r02,r10,r11,r12,r20,r21,r22)), (3,3))
+
+    C_b_m  = C_b_cm / 100.0
+    R_wb   = quat_to_R(quat_wxyz)
+    C_rot  = csdl.matmat(C_b_m, csdl.transpose(R_wb))
+    Kk     = C_b_m.shape[0]
+    pos_t  = csdl.expand(pos_w_m, out_shape=(Kk,3), action='i->ji')
+    C_w    = pos_t + C_rot                           # (K,3) WORLD m
+
+    phiB_K = phi_B_world_m(C_w)                      # (K,)
+    d_soft = csdl.minimum(phiB_K - r_cell)           # conservative soft-min
+    return d_soft
+
+
+
+
+
+# ================ Last stable one sided octree phase ==============#
+# def collision_check(
+#     phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
+#     phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
+#     pos_w_m: csdl.Variable,
+#     quat_wxyz: csdl.Variable,
+#     recorder: csdl.Recorder = None,
+#     *,
+#     max_refine: int = 8,
+#     enable_phase2: bool = True,
+#     K: int = 5,
+#     plot: bool = False,
+#     store_history: bool = False,
+# ) -> csdl.Variable:
+#     """
+#     Octree broad-phase + small differentiable narrow-phase aggregator for two SDFs.
+
+#     Assumptions
+#     ----------
+#     • phi_A_body_cm : evaluates points in BODY frame **centimeters** (returns cm)
+#     • phi_B_world_m : evaluates points in WORLD frame **meters** (returns m)
+#     • (pos, quat) map WORLD→BODY; we convert WORLD meters to BODY cm for φ_A.
+
+#     Returns
+#     -------
+#     d_soft : csdl.Variable (scalar)
+#         Differentiable conservative distance-like metric (soft-min style).
+#     """
+#     import gc
+
+#     # -----------------------
+#     # Helpers (NumPy path)
+#     # -----------------------
+#     def _as_array(x, shape):
+#         return np.asarray(getattr(x, 'value', x), float).reshape(shape)
+
+#     def _quat_to_R_wb(q):
+#         """Rotation matrix (WORLD ← BODY) from quaternion (w,x,y,z)."""
+#         w, x, y, z = q
+#         n = np.linalg.norm(q)
+#         if n == 0:
+#             return np.eye(3)
+#         w, x, y, z = q / n
+#         return np.array([
+#             [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+#             [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+#             [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
+#         ])
+
+#     p_w  = _as_array(pos_w_m, (3,))
+#     R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
+
+#     def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+#         P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+#         P_b_m  = (P_w_m - p_w) @ R_wb.T
+#         P_b_cm = 100.0 * P_b_m
+#         # wrap with csdl.Variable so internal SDF can be reused
+#         vals_cm = phi_A_body_cm(csdl.Variable(value=P_b_cm)).value
+#         return 0.01 * np.asarray(vals_cm).reshape(-1)  # meters
+
+#     def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
+#         P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
+#         vals = phi_B_world_m(csdl.Variable(value=P_w_m)).value
+#         return np.asarray(vals).reshape(-1)
+
+#     # -----------------------
+#     # Use a dummy recorder for broad-phase; pause main
+#     # -----------------------
+#     if recorder is not None:
+#         recorder.stop()
+#     dummy = csdl.Recorder(inline=True)
+#     dummy.start()
+
+#     # -----------------------
+#     # Voxel structure
+#     # -----------------------
+#     class Voxels:
+#         def __init__(self, nodes: np.ndarray, L: int, bounds: tuple):
+#             self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+#             self.L = int(L)
+#             self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
+
+#         @classmethod
+#         def root(cls, bounds):
+#             return cls(nodes=np.array([[0,0,0]], dtype=np.int64), L=0, bounds=bounds)
+
+#         def _sizes(self):
+#             W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
+#             n = 1 << self.L
+#             dx, dy, dz = W/n, H/n, D/n
+#             hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
+#             return dx, dy, dz, hx, hy, hz
+
+#         def centers(self) -> np.ndarray:
+#             dx, dy, dz, _, _, _ = self._sizes()
+#             i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
+#             cx = self.xmin + (i + 0.5) * dx
+#             cy = self.ymin + (j + 0.5) * dy
+#             cz = self.zmin + (k + 0.5) * dz
+#             return np.column_stack([cx, cy, cz]).astype(np.float32, copy=False)  # float32 saves RAM
+
+#         def half_sizes(self) -> tuple:
+#             _, _, _, hx, hy, hz = self._sizes()
+#             return float(hx), float(hy), float(hz)
+
+#         def radius(self) -> float:
+#             hx, hy, hz = self.half_sizes()
+#             return float(np.sqrt(hx*hx + hy*hy + hz*hz))
+
+#         def subdivide(self):
+#             i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
+#             kids = np.array([
+#                 np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|0), axis=1),
+#                 np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|0), axis=1),
+#                 np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|0), axis=1),
+#                 np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|0), axis=1),
+#                 np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|1), axis=1),
+#                 np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|1), axis=1),
+#                 np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|1), axis=1),
+#                 np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
+#             ]).reshape(-1, 3)
+#             return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
+
+#         def restrict(self, mask: np.ndarray):
+#             self.nodes = self.nodes[np.asarray(mask, bool)]
+
+#     # -----------------------
+#     # Auto-size root bounds by probing φ_A in world space
+#     # -----------------------
+#     def _autosize_root_bbox() -> tuple:
+#         dirs = []
+#         s = 1/np.sqrt(2); t = 1/np.sqrt(3)
+#         axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
+#         edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],
+#                  [+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
+#                  [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
+#         corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],
+#                    [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
+#         for d in axes + edges + corners:
+#             v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
+#         radii = np.linspace(0.05, 0.80, 32)  # meters
+#         max_hit = 0.25; margin = 0.05
+#         for d in dirs:
+#             P = p_w[None, :] + radii[:, None] * np.asarray(d, float)[None, :]
+#             phis = phi_A_numeric_world(P)
+#             if (phis > 0.01).any():
+#                 idx = int(np.argmax(phis > 0.01))
+#                 hit_r = radii[min(idx+1, len(radii)-1)]
+#             else:
+#                 hit_r = radii[-1]
+#             max_hit = max(max_hit, float(hit_r))
+#         half = max_hit + margin
+#         return (p_w[0]-half, p_w[0]+half, p_w[1]-half, p_w[1]+half, p_w[2]-half, p_w[2]+half)
+
+#     root_bounds = _autosize_root_bbox()
+
+#     # # free autosize tape immediately
+#     # dummy.stop()
+#     # try:
+#     #     dummy.delete_graph()
+#     # except AttributeError:
+#     #     try:
+#     #         dummy._delete_current_graph()
+#     #     except Exception:
+#     #         pass
+#     # gc.collect()
+#     # dummy.start()
+
+#     # -----------------------
+#     # One refinement step
+#     # -----------------------
+#     def _refine_once(vox: "Voxels"):
+#         vox = vox.subdivide()
+#         r   = vox.radius()
+#         C   = vox.centers()
+#         keep1 = (phi_A_numeric_world(C) <= r)     # Phase-1 on φ_A
+#         vox.restrict(keep1)
+
+#         interval = (np.nan, np.nan)
+#         if enable_phase2 and len(vox.nodes) > 0:
+#             C2   = vox.centers()
+#             phiB = phi_B_numeric_world(C2)
+#             min_u = np.min(phiB) + r
+#             keep2 = (phiB <= (min_u + r))         # Phase-2 on φ_B
+#             vox.restrict(keep2)
+#             interval = (min_u - 2.0*r, min_u)
+#         return vox, interval
+
+#     # -----------------------
+#     # Run refinement (keep only final level unless store_history/plot)
+#     # -----------------------
+#     vox = Voxels.root(root_bounds)
+#     if plot or store_history:
+#         kept3d     = {0: vox.centers().copy()}
+#         halfsizes  = {0: vox.half_sizes()}
+#         intervals  = {0: (np.nan, np.nan)}
+#     else:
+#         kept3d, halfsizes, intervals = {}, {}, None
+
+#     for L in range(max_refine):
+#         vox, inter = _refine_once(vox)
+
+#         if plot or store_history:
+#             kept3d[L+1]    = vox.centers().copy()
+#             halfsizes[L+1] = vox.half_sizes()
+#             if intervals is not None:
+#                 intervals[L+1] = inter
+#         else:
+#             if L + 1 == max_refine:
+#                 kept3d    = {max_refine: vox.centers().copy()}
+#                 halfsizes = {max_refine: vox.half_sizes()}
+
+#         # # free this level's tape
+#         # dummy.stop()
+#         # try:
+#         #     dummy.delete_graph()
+#         # except AttributeError:
+#         #     try:
+#         #         dummy._delete_current_graph()
+#         #     except Exception:
+#         #         pass
+#         # gc.collect()
+#         # dummy.start()
+
+#     # -----------------------
+#     # Select top-K candidates
+#     # -----------------------
+#     C_final = kept3d[max_refine]
+#     hx, hy, hz = halfsizes[max_refine]
+#     r_cell = float(np.linalg.norm([hx, hy, hz]))  # voxel half-diagonal
+
+#     phiB_centers = phi_B_numeric_world(C_final)
+#     scores = phiB_centers - r_cell
+#     order  = np.argsort(scores)
+#     k = int(min(K, len(order)))
+#     C_top = C_final[order[:k]]
+
+#     # Precompute candidate positions in BODY frame (constants in online stage)
+#     p_w_np  = np.asarray(pos_w_m.value, float)
+#     q_wxyz  = np.asarray(quat_wxyz.value, float)
+#     R_wb_np = _quat_to_R_wb(q_wxyz)
+#     R_bw_np = R_wb_np.T
+#     C_b_m   = (C_top - p_w_np[None, :]) @ R_bw_np.T
+#     C_b_cm  = 100.0 * C_b_m
+
+#     # free broad-phase graph before building differentiable bits
+#     dummy.stop()
+#     try:
+#         dummy.delete_graph()
+#     except AttributeError:
+#         try:
+#             dummy._delete_current_graph()
+#         except Exception:
+#             pass
+#     #gc.collect()
+#     if recorder is not None:
+#         recorder.start()
+
+#     # -----------------------
+#     # CSDL helpers (narrow-phase)
+#     # -----------------------
+#     def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
+#         qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+#         r00 = 1.0 - 2.0*(qy*qy + qz*qz)
+#         r01 = 2.0*(qx*qy - qw*qz)
+#         r02 = 2.0*(qx*qz + qw*qy)
+#         r10 = 2.0*(qx*qy + qw*qz)
+#         r11 = 1.0 - 2.0*(qx*qx + qz*qz)
+#         r12 = 2.0*(qy*qz - qw*qx)
+#         r20 = 2.0*(qx*qz - qw*qy)
+#         r21 = 2.0*(qy*qz + qw*qx)
+#         r22 = 1.0 - 2.0*(qx*qx + qy*qy)
+#         R_flat = csdl.vstack((r00, r01, r02, r10, r11, r12, r20, r21, r22))
+#         return csdl.reshape(R_flat, (3, 3))
+
+#     # Pose-tied candidate positions (WORLD) from body-frame constants
+#     C_b_cm_cs = csdl.Variable(value=C_b_cm)        # (K,3) constants
+#     C_b_m_cs  = C_b_cm_cs / 100.0                  # (K,3)
+#     R_wb_cs   = quat_to_rm_csdl(quat_wxyz)         # WORLD←BODY rotation
+#     C_rot     = csdl.matmat(C_b_m_cs, csdl.transpose(R_wb_cs))  # (K,3)
+#     KK        = C_b_m_cs.shape[0]
+#     pos_tiled = csdl.expand(pos_w_m, out_shape=(KK,3), action='i->ji')  # (K,3)
+#     C_w_cs    = pos_tiled + C_rot                  # (K,3)
+
+#     # Evaluate φ_B at those K poses (differentiable w.r.t. pose, not shape A)
+#     phiB_K = phi_B_world_m(C_w_cs)                 # (K,)
+
+#     # Conservative aggregator (soft-min over inflated intersection metric)
+#     # F_K   = csdl.maximum(phiB_K) - 0.15            # conservative scalar from K
+#     # m_K   = F_K - r_cell                           # inflate by voxel radius
+#     # d_soft = csdl.minimum(m_K)                  
+    
+#     m_K  = phiB_K - (r_cell)                         # (K,) per-candidate conservative margin
+#     d_soft = csdl.minimum(m_K)                      # smooth min across K
+
+
+#     # -----------------------
+#     # Optional visualization (allocates grids only if plot=True)
+#     # -----------------------
+#     if plot:
+#         try:
+#             import pyvista as pv
+#             C = kept3d[max_refine]
+#             if len(C) == 0:
+#                 mins = np.array([[root_bounds[0], root_bounds[2], root_bounds[4]]], dtype=np.float32)
+#                 maxs = np.array([[root_bounds[1], root_bounds[3], root_bounds[5]]], dtype=np.float32)
+#             else:
+#                 H = np.tile(np.array([hx, hy, hz], np.float32), (len(C), 1))
+#                 mins = C - H; maxs = C + H
+#             xmin, ymin, zmin = mins.min(axis=0)
+#             xmax, ymax, zmax = maxs.max(axis=0)
+#             pad = 0.35
+#             xmin -= pad; ymin -= pad; zmin -= pad
+#             xmax += pad; ymax += pad; zmax += pad
+
+#             Nx = Ny = Nz = 96
+#             x = np.linspace(xmin, xmax, Nx)
+#             y = np.linspace(ymin, ymax, Ny)
+#             z = np.linspace(zmin, zmax, Nz)
+#             X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
+#             P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+#             phiA = phi_A_numeric_world(P).reshape(X.shape)
+#             phiB = phi_B_numeric_world(P).reshape(X.shape)
+
+#             plotter = pv.Plotter()
+#             if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
+#                 gridA = pv.ImageData()
+#                 gridA.dimensions = np.array(phiA.shape)
+#                 gridA.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+#                 gridA.origin    = (x[0], y[0], z[0])
+#                 gridA.point_data["phiA"] = phiA.flatten(order="F")
+#                 contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
+#                 plotter.add_mesh(contA, color="royalblue", opacity=0.55)
+
+#             if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
+#                 gridB = pv.ImageData()
+#                 gridB.dimensions = np.array(phiB.shape)
+#                 gridB.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
+#                 gridB.origin    = (x[0], y[0], z[0])
+#                 gridB.point_data["phiB"] = phiB.flatten(order="F")
+#                 contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
+#                 plotter.add_mesh(contB, color="tomato", opacity=0.55)
+
+#             Cdraw = kept3d[max_refine]
+#             MAX_DRAW = 1500
+#             step = max(1, len(Cdraw)//MAX_DRAW if len(Cdraw) else 1)
+#             for i in range(0, len(Cdraw), step):
+#                 cx, cy, cz = map(float, Cdraw[i])
+#                 cube = pv.Cube(center=(cx, cy, cz),
+#                                x_length=2*hx, y_length=2*hy, z_length=2*hz)
+#                 plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
+
+#             plotter.show_bounds(grid='front', location='outer', color='black',
+#                                 xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
+#             plotter.add_axes(); plotter.add_title("Pose / Remaining Cells")
+#             plotter.show()
+#         except Exception as e:
+#             print("[viz] skipped:", e)
+
+#     return d_soft
+
+
+
+
+
+
 # _DEF_EPS = 1e-12
 
+# ================ HYBRID METHOD ================
 # def _as_array(x, shape=None):
 #     arr = np.asarray(getattr(x, 'value', x), float)
 #     return arr if shape is None else arr.reshape(shape)
@@ -504,412 +1059,11 @@ import csdl_alpha as csdl
 # =============== END HYBRID METHOD ===============
 
 
-def collision_check(
-    phi_A_body_cm: Callable[[csdl.Variable], csdl.Variable],
-    phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
-    pos_w_m: csdl.Variable,
-    quat_wxyz: csdl.Variable,
-    recorder: csdl.Recorder = None,
-    *,
-    max_refine: int = 8,
-    enable_phase2: bool = True,
-    K: int = 5,
-    plot: bool = False,
-) -> Tuple[Dict[int, np.ndarray], Dict[int, Tuple[float, float, float]], csdl.Variable, csdl.Variable, np.ndarray]:
-    """
-    Octree broad-phase + (small) differentiable narrow-phase aggregator for two SDFs.
-
-    Assumptions
-    ----------
-    • phi_A_body_cm : evaluates points given in DRONE BODY frame **centimeters** (returns cm)
-    • phi_B_world_m : evaluates points given in WORLD frame **meters** (returns m)
-    • The drone pose (pos, quat) maps WORLD→BODY; we convert WORLD meters to BODY cm for φ_A.
-
-    Parameters
-    ----------
-    phi_A_body_cm : Callable[[csdl.Variable], csdl.Variable]
-        CSDL SDF for object A (drone) in body/cm.
-    phi_B_world_m : Callable[[csdl.Variable], csdl.Variable]
-        CSDL SDF for object/obstacle B in world/m.
-    pos_w_m : csdl.Variable (shape (3,))
-        Drone position in world coordinates (meters).
-    quat_wxyz : csdl.Variable (shape (4,))
-        World-from-body quaternion in (w,x,y,z) order.
-    max_refine : int, default 8
-        Octree depth (number of refinement iterations).
-    enable_phase2 : bool, default True
-        If True, apply extra culling using φ_B at voxel centers.
-    K : int, default 5
-        Number of top candidate voxels to feed the differentiable aggregator.
-    plot : bool, default False
-        If True, produce PyVista/Matplotlib visualizations.
-
-    Returns
-    -------
-    kept3d : dict[int, (N_L,3) np.ndarray]
-        Per refinement level L ∈ {0..max_refine}, voxel centers kept (WORLD, m).
-    halfsizes : dict[int, (hx,hy,hz)]
-        Per level voxel half-sizes (WORLD, m).
-    d_soft : csdl.Variable (scalar)
-        Differentiable conservative distance-like metric (soft-min over K candidates).
-    stack : csdl.Variable (K, 1)
-        The per-candidate conservative intersection values before soft-min.
-    C_top : (K,3) np.ndarray
-        WORLD (m) coordinates of the K candidates used in the differentiable stage.
-    """
-
-    # -----------------------
-    # Helpers (NumPy path)
-    # -----------------------
-    def _as_array(x, shape):
-        return np.asarray(getattr(x, 'value', x), float).reshape(shape)
-
-    def _quat_to_R_wb(q):
-        """Rotation matrix (WORLD ← BODY) from quaternion (w,x,y,z)."""
-        w, x, y, z = q
-        n = np.linalg.norm(q)
-        if n == 0:
-            return np.eye(3)
-        w, x, y, z = q / n
-        return np.array([
-            [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
-            [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-            [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)]
-        ])
-
-    p_w  = _as_array(pos_w_m, (3,))
-    R_wb = _quat_to_R_wb(_as_array(quat_wxyz, (4,)))
-
-    def phi_A_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
-        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-        P_b_m  = (P_w_m - p_w) @ R_wb.T        # world→body (meters)
-        P_b_cm = 100.0 * P_b_m                 # meters→centimeters
-        vals_cm = phi_A_body_cm(P_b_cm).value  # cm
-        return 0.01 * np.asarray(vals_cm).reshape(-1)  # meters
-
-    def phi_B_numeric_world(P_w_m: np.ndarray) -> np.ndarray:
-        P_w_m = np.asarray(P_w_m, float).reshape(-1, 3)
-        vals = phi_B_world_m(P_w_m).value
-        return np.asarray(vals).reshape(-1)
-
-    # Freeze current recorder for broad-phase, use dummy recorder for now
-    recorder.stop()
-    dummy = csdl.Recorder(inline=True)
-    dummy.start()
-
-    # -----------------------
-    # Voxel structure
-    # -----------------------
-    class Voxels:
-        def __init__(self, nodes: np.ndarray, L: int, bounds: Tuple[float, float, float, float, float, float]):
-            self.nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
-            self.L = int(L)
-            self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = map(float, bounds)
-
-        @classmethod
-        def root(cls, bounds):
-            return cls(nodes=np.array([[0,0,0]], dtype=np.int64), L=0, bounds=bounds)
-
-        def _sizes(self):
-            W = self.xmax - self.xmin; H = self.ymax - self.ymin; D = self.zmax - self.zmin
-            n = 1 << self.L
-            dx, dy, dz = W/n, H/n, D/n
-            hx, hy, hz = 0.5*dx, 0.5*dy, 0.5*dz
-            return dx, dy, dz, hx, hy, hz
-
-        def centers(self) -> np.ndarray:
-            dx, dy, dz, _, _, _ = self._sizes()
-            i = self.nodes[:,0].astype(float); j = self.nodes[:,1].astype(float); k = self.nodes[:,2].astype(float)
-            cx = self.xmin + (i + 0.5) * dx
-            cy = self.ymin + (j + 0.5) * dy
-            cz = self.zmin + (k + 0.5) * dz
-            return np.column_stack([cx, cy, cz])
-
-        def half_sizes(self) -> Tuple[float, float, float]:
-            _, _, _, hx, hy, hz = self._sizes()
-            return float(hx), float(hy), float(hz)
-
-        def radius(self) -> float:
-            hx, hy, hz = self.half_sizes()
-            return float(np.sqrt(hx*hx + hy*hy + hz*hz))
-
-        def subdivide(self):
-            i = self.nodes[:,0]; j = self.nodes[:,1]; k = self.nodes[:,2]
-            kids = np.array([
-                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|0), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|0, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|0, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|0, (j<<1)|1, (k<<1)|1), axis=1),
-                np.stack(((i<<1)|1, (j<<1)|1, (k<<1)|1), axis=1),
-            ]).reshape(-1, 3)
-            return Voxels(kids, self.L+1, (self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax))
-
-        def restrict(self, mask: np.ndarray):
-            self.nodes = self.nodes[np.asarray(mask, bool)]
-
-    # -----------------------
-    # Auto-size root bounds by probing φ_A in world space
-    # -----------------------
-    def _autosize_root_bbox() -> Tuple[float, float, float, float, float, float]:
-        dirs = []
-        s = 1/np.sqrt(2); t = 1/np.sqrt(3)
-        axes  = [[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]]
-        edges = [[+s,+s,0],[+s,-s,0],[-s,+s,0],[-s,-s,0],
-                 [+s,0,+s],[+s,0,-s],[-s,0,+s],[-s,0,-s],
-                 [0,+s,+s],[0,+s,-s],[0,-s,+s],[0,-s,-s]]
-        corners = [[+t,+t,+t],[+t,+t,-t],[+t,-t,+t],[+t,-t,-t],
-                   [-t,+t,+t],[-t,+t,-t],[-t,-t,+t],[-t,-t,-t]]
-        for d in axes + edges + corners:
-            v = np.asarray(d, float); v /= np.linalg.norm(v); dirs.append(v)
-        radii = np.linspace(0.05, 0.80, 32)  # meters
-        max_hit = 0.25; margin = 0.05
-        for d in dirs:
-            phis = [phi_A_numeric_world([p_w + r*d])[0] for r in radii]
-            phis = np.asarray(phis)
-            if (phis > 0.01).any():
-                idx = np.argmax(phis > 0.01)
-                hit_r = radii[min(idx+1, len(radii)-1)]
-            else:
-                hit_r = radii[-1]
-            max_hit = max(max_hit, float(hit_r))
-        half = max_hit + margin
-        return (p_w[0]-half, p_w[0]+half, p_w[1]-half, p_w[1]+half, p_w[2]-half, p_w[2]+half)
-
-    root_bounds = _autosize_root_bbox()
-
-    # -----------------------
-    # One refinement step
-    # -----------------------
-    def _refine_once(vox: "Voxels"):
-        vox = vox.subdivide()
-        r   = vox.radius()
-        C   = vox.centers()
-        keep1 = (phi_A_numeric_world(C) <= r)     # Phase-1 on φ_A
-        vox.restrict(keep1)
-
-        interval = (np.nan, np.nan)
-        if enable_phase2 and len(vox.nodes) > 0:
-            C2 = vox.centers()
-            phiB = phi_B_numeric_world(C2)
-            min_u = np.min(phiB) + r
-            keep2 = (phiB <= (min_u + r))         # Phase-2 on φ_B
-            vox.restrict(keep2)
-            interval = (min_u - 2.0*r, min_u)
-        return vox, interval
-
-    # -----------------------
-    # Run refinement
-    # -----------------------
-    vox = Voxels.root(root_bounds)
-    kept3d     = {0: vox.centers().copy()}
-    intervals  = {0: (np.nan, np.nan)}
-    halfsizes  = {0: vox.half_sizes()}
-
-    for L in range(max_refine):
-        vox, inter = _refine_once(vox)
-        kept3d[L+1]    = vox.centers().copy()
-        intervals[L+1] = inter
-        halfsizes[L+1] = vox.half_sizes()
-
-    # -----------------------
-    # Setup for online phase
-    # -----------------------
-    C_final = kept3d[max_refine]
-
-    hx, hy, hz = halfsizes[max_refine]
-    r_cell = float(np.linalg.norm([hx, hy, hz]))  # half-diagonal of voxels at final level
-
-    # Rank candidates by conservative score φ_B(center) - r_cell
-    phiB_centers = phi_B_numeric_world(C_final)
-    scores = phiB_centers - r_cell
-    order  = np.argsort(scores)
-    k = int(min(K, len(order)))
-    C_top = C_final[order[:k]]
 
 
-    # --- NEW: store candidates in A's body frame (constants for the online phase) ---
-    p_w_np  = np.asarray(pos_w_m.value, float)                   # offline pose used above
-    q_wxyz  = np.asarray(quat_wxyz.value, float)
-    R_wb_np = _quat_to_R_wb(q_wxyz)                              # you already have this helper
-    R_bw_np = R_wb_np.T
-    C_b_m   = (C_top - p_w_np[None, :]) @ R_bw_np.T              # (K,3) body meters
-    C_b_cm  = 100.0 * C_b_m                                      # (K,3) body cm for φ_A
-    
-    # Switch back to main recorder for differentiable ops
-    dummy.stop()
-    recorder.start()
-    
-    # ---- CSDL helpers for pose + φ_A in world ----
-    def quat_to_rm_csdl(q: csdl.Variable) -> csdl.Variable:
-        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
-        r00 = 1.0 - 2.0*(qy*qy + qz*qz)
-        r01 = 2.0*(qx*qy - qw*qz)
-        r02 = 2.0*(qx*qz + qw*qy)
-        r10 = 2.0*(qx*qy + qw*qz)
-        r11 = 1.0 - 2.0*(qx*qx + qz*qz)
-        r12 = 2.0*(qy*qz - qw*qx)
-        r20 = 2.0*(qx*qz - qw*qy)
-        r21 = 2.0*(qy*qz + qw*qx)
-        r22 = 1.0 - 2.0*(qx*qx + qy*qy)
-        R_flat = csdl.vstack((r00, r01, r02,
-                              r10, r11, r12,
-                              r20, r21, r22))
-        return csdl.reshape(R_flat, (3, 3))
+#SDF = Callable[[csdl.Variable], csdl.Variable]
 
-    def phi_A_world_m(p_w: csdl.Variable) -> csdl.Variable:
-        R_wb_cs = quat_to_rm_csdl(quat_wxyz)
-        R_bw_cs = csdl.transpose(R_wb_cs)
-        if p_w.shape == (3,):
-            rel = p_w - pos_w_m
-            x_b_cm = 100.0 * csdl.matvec(R_bw_cs, rel)      # (3,)
-            return phi_A_body_cm(x_b_cm) / 100.0            # scalar
-        else:
-            K = p_w.shape[0]
-            pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')
-            rel = p_w - pos_tiled                           # (K,3)
-            x_b_cm = 100.0 * csdl.matmat(rel, R_bw_cs)      # (K,3)
-            return phi_A_body_cm(x_b_cm) / 100.0            # (K,)
-
-
-    # ---- Pose-tied candidate positions (world) from body-frame constants ----
-    C_b_cm_cs = csdl.Variable(value=C_b_cm)          # (K,3) constants
-    C_b_m_cs  = C_b_cm_cs / 100.0                    # (K,3)
-    R_wb_cs   = quat_to_rm_csdl(quat_wxyz)           # WORLD←BODY (live)
-    # C_b_m_cs: (K,3), R_wb_cs: (3,3)
-    C_rot   = csdl.matmat(C_b_m_cs, csdl.transpose(R_wb_cs))  # (K,3)
-
-    K = C_b_m_cs.shape[0]  # e.g., 5
-    pos_tiled = csdl.expand(pos_w_m, out_shape=(K,3), action='i->ji')  # (K,3)
-
-    C_w_cs = pos_tiled + C_rot  # (K,3)
-
-
-    # ---- Evaluate at those world points; BOTH φ_A and φ_B are used ----
-    # (φ_A_world_m can take batched (K,3); if not, loop—shape stays (K,))
-    #phiA_K = phi_A_world_m(C_w_cs)                   # (K,) -> carries SHAPE sensitivities
-    phiB_K = phi_B_world_m(C_w_cs)                   # (K,) -> carries POSE sensitivities
-
-    # Recommended: soft intersection at each candidate, then conservative inflation
-
-    F_K   = csdl.maximum(phiB_K) - 0.15                    # (K,)
-    m_K   = F_K - r_cell                                         # conservative
-    d_soft = csdl.minimum(m_K)                                   # KS-min over K
-
-
-    # -----------------------
-    # Optional visualization (PyVista + Matplotlib)
-    # -----------------------
-    if plot:
-        try:
-            import pyvista as pv
-            # Build a local grid around the remaining cells for context
-            C = kept3d[max_refine]
-            if len(C) == 0:
-                mins = np.array([[root_bounds[0], root_bounds[2], root_bounds[4]]])
-                maxs = np.array([[root_bounds[1], root_bounds[3], root_bounds[5]]])
-            else:
-                H = np.tile(np.array([hx, hy, hz], float), (len(C), 1))
-                mins = C - H; maxs = C + H
-            xmin, ymin, zmin = mins.min(axis=0)
-            xmax, ymax, zmax = maxs.max(axis=0)
-            pad = 0.35
-            xmin -= pad; ymin -= pad; zmin -= pad
-            xmax += pad; ymax += pad; zmax += pad
-
-            Nx = Ny = Nz = 96
-            x = np.linspace(xmin, xmax, Nx)
-            y = np.linspace(ymin, ymax, Ny)
-            z = np.linspace(zmin, zmax, Nz)
-            X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
-            P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-
-            phiA = phi_A_numeric_world(P).reshape(X.shape)
-            phiB = phi_B_numeric_world(P).reshape(X.shape)
-
-            plotter = pv.Plotter()
-            # φ_A isosurface
-            if (phiA.min() <= 0.0) and (phiA.max() >= 0.0):
-                gridA = pv.ImageData()
-                gridA.dimensions = np.array(phiA.shape)
-                gridA.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
-                gridA.origin    = (x[0], y[0], z[0])
-                gridA.point_data["phiA"] = phiA.flatten(order="F")
-                contA = gridA.contour(isosurfaces=[0.0], scalars="phiA")
-                plotter.add_mesh(contA, color="royalblue", opacity=0.55)
-
-            # φ_B isosurface
-            if (phiB.min() <= 0.0) and (phiB.max() >= 0.0):
-                gridB = pv.ImageData()
-                gridB.dimensions = np.array(phiB.shape)
-                gridB.spacing   = (x[1]-x[0], y[1]-y[0], z[1]-z[0])
-                gridB.origin    = (x[0], y[0], z[0])
-                gridB.point_data["phiB"] = phiB.flatten(order="F")
-                contB = gridB.contour(isosurfaces=[0.0], scalars="phiB")
-                plotter.add_mesh(contB, color="tomato", opacity=0.55)
-
-            # Remaining voxel wireframes (downsampled)
-            Cdraw = kept3d[max_refine]
-            MAX_DRAW = 1500
-            step = max(1, len(Cdraw)//MAX_DRAW if len(Cdraw) else 1)
-            for i in range(0, len(Cdraw), step):
-                cx, cy, cz = Cdraw[i]
-                cube = pv.Cube(center=(cx, cy, cz),
-                               x_length=2*hx, y_length=2*hy, z_length=2*hz)
-                plotter.add_mesh(cube, style="wireframe", color="yellow", line_width=1.0, opacity=0.85)
-
-            plotter.show_bounds(grid='front', location='outer', color='black',
-                                xlabel='x (m)', ylabel='y (m)', zlabel='z (m)')
-            plotter.add_axes(); plotter.add_title("Pose / Remaining Cells")
-            plotter.show()
-        except Exception as e:
-            print("[viz] skipped:", e)
-
-        # Matplotlib diagnostic plots (counts + φ_B bracket intervals)
-        try:
-            import matplotlib.pyplot as plt
-            order = sorted(kept3d.keys())
-            counts = [len(kept3d[k]) for k in order]
-            lows   = [intervals[k][0] for k in order]
-            upps   = [intervals[k][1] for k in order]
-            mids   = [0.5*(l+u) for l, u in zip(lows, upps)]
-
-            figC, axC = plt.subplots(figsize=(6,4))
-            axC.plot(order, counts, marker='o')
-            axC.set_xticks(order); axC.set_xlabel("Refine level L")
-            axC.set_ylabel("Voxels kept")
-            axC.set_title(f"3D remaining voxels ({'Phase-1+2' if enable_phase2 else 'Phase-1 only'})")
-            axC.grid(True, alpha=0.3)
-
-            figI, axI = plt.subplots(figsize=(7,4))
-            axI.plot(order, lows, marker='v', label='Lower bound')
-            axI.plot(order, upps, marker='^', label='Upper bound')
-            axI.plot(order, mids, marker='o', linestyle='--', label='Midpoint')
-            axI.set_xticks(order)
-            axI.set_xlabel("Refine level L"); axI.set_ylabel("Bracket on min φ_B (restricted)")
-            axI.set_title("3D interval bounds over refinement levels")
-            axI.grid(True, alpha=0.3); axI.legend()
-            plt.show()
-        except Exception as e:
-            print("[plot] skipped:", e)
-
-    return d_soft
-
-
-
-
-
-
-
-
-
-
-
-SDF = Callable[[csdl.Variable], csdl.Variable]
-
-_DEF_EPS = 1e-12
+#_DEF_EPS = 1e-12
 
 # # Collision check similar to paper
 # def collision_check(
