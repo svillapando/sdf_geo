@@ -683,7 +683,7 @@ def collision_check(
     phi_B_world_m: Callable[[csdl.Variable], csdl.Variable],
     pos_w_m: csdl.Variable,
     quat_wxyz: csdl.Variable,
-    C_b_cm: np.ndarray,
+    C_b_cm: csdl.Variable,
 ) -> csdl.Variable:
    
 
@@ -727,7 +727,7 @@ def collision_check(
         return phi_A_world_m
 
     # Pose-tied candidate positions (WORLD) from body-frame constants
-    C_b_cm_cs = csdl.Variable(value=C_b_cm)        # (K,3) constants in cm
+    C_b_cm_cs = C_b_cm        # (K,3) constants in cm
     C_b_m_cs  = C_b_cm_cs / 100.0                  # (K,3) meters
     R_wb_cs   = quat_to_rm_csdl(quat_wxyz)         # WORLD←BODY rotation
     C_rot     = csdl.matmat(C_b_m_cs, csdl.transpose(R_wb_cs))  # (K,3)
