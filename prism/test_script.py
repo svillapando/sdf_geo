@@ -25,8 +25,8 @@ P = csdl.Variable(value=np.stack([X, Y, Z], axis=-1))  # shape: (res, res, res, 
 c = csdl.Variable(value = np.zeros(3))                             # Sphere center
 R = csdl.Variable(value = 1.0)                                     # Sphere radius
 
-center = csdl.Variable(value = np.zeros(3))                        # Box Center
-half_size = csdl.Variable(value = np.array([0.25, 1.5, 1.5]))      # Box dimensions
+center =  np.zeros(3)                       # Box Center
+half_size = np.array([0.25, 1.5, 1.5])      # Box dimensions
 rotation_angles = [0, 0, 0]                                        # Rotation in degrees
 
 p0 = np.zeros(3)                            # Plane origin
