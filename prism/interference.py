@@ -670,10 +670,9 @@ def broadphase(
 
 
     # Precompute candidate positions in BODY frame (constants in online stage)
-    p_w_np  = np.asarray(pos_w_m.value, float)
-    q_wxyz  = np.asarray(quat_wxyz.value, float)
-    R_wb_np = _quat_to_R_wb(q_wxyz)
-    C_b_m  = (C_top - p_w_np[None, :]) @ R_wb_np
+
+    R_wb_np = _quat_to_R_wb(quat_wxyz)
+    C_b_m  = (C_top - pos_w_m) @ R_wb_np
     C_b_cm = 100.0 * C_b_m
 
     return C_b_cm
