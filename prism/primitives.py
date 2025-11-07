@@ -2,11 +2,14 @@ import numpy as np
 import csdl_alpha as csdl
 from scipy.spatial.transform import Rotation
 
+
+_EPS = 1e-12
+
 def sdf_box(center, half_size, rotation_angles, degrees=True):
     def _sdf(p):
         R = Rotation.from_euler('xyz', rotation_angles, degrees=degrees).as_matrix()
         R_T = R.T
-        eps = 1e-12
+
 
         # ---- broadcast geometry with CSDL-safe ops ----
         if len(p.shape) == 1:
@@ -28,13 +31,13 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
         q_clip = csdl.maximum(q, np.broadcast_to(0.0, q.shape))
 
         if len(q_clip.shape) == 1:
-            # ||q_clip||_2 with epsilon (safe)
+            # ||q_clip||_2 with _EPSilon (safe)
             norm_sq = csdl.vdot(q_clip, q_clip)
-            norm_val = csdl.sqrt(norm_sq + eps)
+            norm_val = csdl.sqrt(norm_sq + _EPS)
         else:
             # sum over last axis
             norm_sq = csdl.sum(q_clip * q_clip, axes=(len(q_clip.shape) - 1,))
-            norm_val = csdl.sqrt(norm_sq + eps)
+            norm_val = csdl.sqrt(norm_sq + _EPS)
 
         q_max = csdl.maximum(q, axes=(len(q.shape) - 1,))
         correction = csdl.minimum(q_max, np.broadcast_to(0.0, q_max.shape))
@@ -46,7 +49,7 @@ def sdf_box(center, half_size, rotation_angles, degrees=True):
 
 def sdf_sphere(center, radius):
     def _sdf(p):
-        eps = 1e-12
+  
 
         # ---- broadcast center with CSDL-safe ops ----
         if len(p.shape) == 1:
@@ -62,19 +65,19 @@ def sdf_sphere(center, radius):
         if len(p.shape) == 1:
             # safe Euclidean norm
             norm_sq = csdl.vdot(dist, dist)
-            return csdl.sqrt(norm_sq + eps) - radius
+            return csdl.sqrt(norm_sq + _EPS) - radius
         else:
             norm_sq = csdl.sum(dist * dist, axes=(last_axis,))
-            return csdl.sqrt(norm_sq + eps) - radius
+            return csdl.sqrt(norm_sq + _EPS) - radius
 
     return _sdf
 
 
 def sdf_plane(p0, normal):
     def _sdf(p):
-        eps = 1e-12
+
         # ---- normalize normal (true signed distance scale) ----
-        n_norm = csdl.sqrt(csdl.vdot(normal, normal) + eps)
+        n_norm = csdl.sqrt(csdl.vdot(normal, normal) + _EPS)
         n_unit = normal / n_norm
 
         # ---- broadcast with CSDL-safe ops ----
@@ -95,7 +98,6 @@ def sdf_plane(p0, normal):
 
 def sdf_capsule(p1, p2, radius):
     def _sdf(p):
-        eps = 1e-12
 
         # ---- broadcast p1 with CSDL-safe ops ----
         if len(p.shape) == 1:
@@ -106,7 +108,7 @@ def sdf_capsule(p1, p2, radius):
             p1_b = csdl.tensordot(ones_leading, p1, axes=None)
 
         ba = p2 - p1                          # (3,)
-        axis_len_sq = csdl.sum(ba * ba) + eps # add eps before division
+        axis_len_sq = csdl.sum(ba * ba) + _EPS # add _EPS before division
 
         pa = p - p1_b                          # (..., 3)
         last = len(p.shape) - 1
@@ -128,22 +130,57 @@ def sdf_capsule(p1, p2, radius):
         if len(p.shape) == 1:
             diff = p - proj
             dist_sq = csdl.vdot(diff, diff)
-            d = csdl.sqrt(dist_sq + eps) - radius
+            d = csdl.sqrt(dist_sq + _EPS) - radius
         else:
             diff = p - proj
             dist_sq = csdl.sum(diff * diff, axes=(len(p.shape) - 1,))
-            d = csdl.sqrt(dist_sq + eps) - radius
+            d = csdl.sqrt(dist_sq + _EPS) - radius
         return d
 
     return _sdf
 
+def sdf_cylinder(center, radius, half_height, rotation_angles=(0.0, 0.0, 0.0), *, degrees=True):
+
+    R = Rotation.from_euler('xyz', rotation_angles, degrees=degrees).as_matrix()
+    R_T = R.T
+
+    def _sdf(p):
+        # ---- broadcast center with CSDL-safe ops ----
+        if len(p.shape) == 1:
+            c_b = center
+        else:
+            lead_shape   = p.shape[:-1]
+            ones_leading = np.ones(lead_shape)
+            c_b = csdl.tensordot(ones_leading, center, axes=None)
+
+        # world -> local (cylinder frame: axis = local Y)
+        p_local = p - c_b
+        last_axis = len(p_local.shape) - 1
+        pl = csdl.tensordot(p_local, R_T, axes=([last_axis], [1]))  # (...,3)
+
+        # radial distance in XZ plane
+        rxz_sq = pl[..., 0]*pl[..., 0] + pl[..., 2]*pl[..., 2]
+        rxz    = csdl.sqrt(rxz_sq + _EPS)
+
+        qx = rxz - radius
+        qy = csdl.absolute(pl[..., 1]) - half_height
+
+        # Outside part: length(max(q,0))
+        qx_pos = csdl.maximum(qx, np.broadcast_to(0.0, qx.shape))
+        qy_pos = csdl.maximum(qy, np.broadcast_to(0.0, qy.shape))
+        out_sq = qx_pos*qx_pos + qy_pos*qy_pos
+        outside = csdl.sqrt(out_sq + _EPS)
+
+        # Inside part: min(max(qx,qy), 0)
+        mx = csdl.maximum(qx, qy)
+        inside = csdl.minimum(mx, np.broadcast_to(0.0, mx.shape))
+
+        return outside + inside
+
+    return _sdf
 
 # ================= Numpy Versions for Explicit Op =================#
-_EPS = 1e-12
 
-# primitives_np.py
-import numpy as np
-from scipy.spatial.transform import Rotation as SciRot
 
 def sdf_box_np(center, half_size, rotation_angles=(0.0, 0.0, 0.0), *, degrees=True, order='xyz'):
     """
@@ -155,7 +192,7 @@ def sdf_box_np(center, half_size, rotation_angles=(0.0, 0.0, 0.0), *, degrees=Tr
     h = np.asarray(half_size, float).reshape(3)
 
     # SciPy rotation → 3x3 matrix; same semantics as your CSDL path
-    Rm = SciRot.from_euler(order, rotation_angles, degrees=degrees).as_matrix()
+    Rm = Rotation.from_euler(order, rotation_angles, degrees=degrees).as_matrix()
     RT = Rm.T  # world -> box frame
 
     def _sdf(P):
@@ -230,4 +267,34 @@ def sdf_capsule_np(p1, p2, radius):
             t = np.clip((ap @ ab) / denom, 0.0, 1.0)           # (N,)
             closest = a[None, :] + t[:, None] * ab[None, :]    # (N,3)
             return np.linalg.norm(P - closest, axis=-1) - r
+    return _sdf
+
+def sdf_cylinder_np(center, radius, half_height, rotation_angles=(0.0, 0.0, 0.0), *, degrees=True):
+    """
+    NumPy version of the capped cylinder (IQ) oriented by Euler angles.
+    """
+    c = np.asarray(center, float).reshape(3)
+    r = float(radius)
+    h = float(half_height)
+    RT = Rotation.from_euler('xyz', rotation_angles, degrees=degrees).as_matrix().T
+
+    def _sdf(P):
+        P = np.asarray(P, float)
+        if P.ndim == 1:
+            pl = (P - c) @ RT
+            rxz = np.linalg.norm([pl[0], pl[2]])
+            qx = rxz - r
+            qy = abs(pl[1]) - h
+            outside = np.linalg.norm([max(qx, 0.0), max(qy, 0.0)])
+            inside  = min(max(qx, qy), 0.0)
+            return outside + inside
+        else:
+            pl = (P - c[None, :]) @ RT
+            rxz = np.linalg.norm(pl[:, [0, 2]], axis=1)
+            qx = rxz - r
+            qy = np.abs(pl[:, 1]) - h
+            outside = np.linalg.norm(np.c_[np.maximum(qx, 0.0), np.maximum(qy, 0.0)], axis=1)
+            inside  = np.minimum(np.maximum(qx, qy), 0.0)
+            return outside + inside
+
     return _sdf
