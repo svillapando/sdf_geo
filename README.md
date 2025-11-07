@@ -1,4 +1,4 @@
-# PRISM – Procedural Representation of Implicit Surfaces Modeling
+# PRISM – Procedural Representation of Implicit Surface Modeling
 
 
 
