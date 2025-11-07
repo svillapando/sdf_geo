@@ -8,11 +8,11 @@ PRISM is a composable Signed Distance Function (SDF) framework for geometric mod
 
 ## Features
 
-\- Primitive SDFs: sphere, box, capsule, plane
+\- Primitive SDFs: sphere, box, capsule, plane, cylinder
 
 \- Operations: smooth union, intersection, subtraction
 
-\- Visualization tools for 2D slices and 3D isosurfaces
+\- Visualization tools for 2D slices, 3D isosurfaces, and Eikonal Errors
 
 ### Installation Instructions
 
