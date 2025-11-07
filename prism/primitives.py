@@ -154,28 +154,39 @@ def sdf_cylinder(center, radius, half_height, rotation_angles=(0.0, 0.0, 0.0), *
             c_b = csdl.tensordot(ones_leading, center, axes=None)
 
         # world -> local (cylinder frame: axis = local Y)
-        p_local = p - c_b
-        last_axis = len(p_local.shape) - 1
-        pl = csdl.tensordot(p_local, R_T, axes=([last_axis], [1]))  # (...,3)
+        p_local  = p - c_b
+        last_ax  = len(p_local.shape) - 1
+        pl       = csdl.tensordot(p_local, R_T, axes=([last_ax], [1]))  # (...,3)
 
-        # radial distance in XZ plane
-        rxz_sq = pl[..., 0]*pl[..., 0] + pl[..., 2]*pl[..., 2]
-        rxz    = csdl.sqrt(rxz_sq + _EPS)
+        # ---- Avoid ellipsis-based slicing by projecting onto basis ----
+        ex = np.array([1.0, 0.0, 0.0])
+        ey = np.array([0.0, 1.0, 0.0])
+        ez = np.array([0.0, 0.0, 1.0])
+
+        px = csdl.tensordot(pl, ex, axes=([last_ax], [0]))  # shape: leading dims
+        py = csdl.tensordot(pl, ey, axes=([last_ax], [0]))
+        pz = csdl.tensordot(pl, ez, axes=([last_ax], [0]))
+
+        eps   = 1e-12
+        rxz_sq = px*px + pz*pz
+        rxz    = csdl.sqrt(rxz_sq + eps)
 
         qx = rxz - radius
-        qy = csdl.absolute(pl[..., 1]) - half_height
+        qy = csdl.absolute(py) - half_height
 
         # Outside part: length(max(q,0))
-        qx_pos = csdl.maximum(qx, np.broadcast_to(0.0, qx.shape))
-        qy_pos = csdl.maximum(qy, np.broadcast_to(0.0, qy.shape))
-        out_sq = qx_pos*qx_pos + qy_pos*qy_pos
-        outside = csdl.sqrt(out_sq + _EPS)
+        zeros   = np.broadcast_to(0.0, qx.shape)
+        qx_pos  = csdl.maximum(qx, zeros)
+        qy_pos  = csdl.maximum(qy, zeros)
+        out_sq  = qx_pos*qx_pos + qy_pos*qy_pos
+        outside = csdl.sqrt(out_sq + eps)
 
         # Inside part: min(max(qx,qy), 0)
-        mx = csdl.maximum(qx, qy)
-        inside = csdl.minimum(mx, np.broadcast_to(0.0, mx.shape))
+        mx     = csdl.maximum(qx, qy)
+        inside = csdl.minimum(mx, zeros)
 
         return outside + inside
+
 
     return _sdf
 
